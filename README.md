@@ -576,14 +576,8 @@ visible, and gracefully falls back to CPU otherwise.
 
 ### First run (training from scratch)
 
-#### Run with temperature 0.0 (deterministic)
 ```sh
 ./chesSLM
-```
-
-#### Run with temperature 0.3
-```sh
-./chesSLM --temperature 0.3
 ```
 
 On a machine with no cached artifacts, this will: stream and filter the
@@ -598,3 +592,21 @@ Once `chesslm_model.pt` and `chesslm_vocab.json` exist, simply running
 trained model, runs the brief warmup pass, and starts a UCI engine, ready
 to be pointed at by any UCI-capable GUI (configure the GUI to use
 `python chesslm.py` as the engine's executable).
+
+If you want to use the model right away without training it from scratch, you can download the fine-tuned weights directly from **Hugging Face**:
+
+[https://huggingface.co/antoniopelusi/chesSLM/](https://huggingface.co/antoniopelusi/chesSLM/),
+
+and the source code to run it from **Github**:
+
+[https://github.com/antoniopelusi/chesSLM/](https://github.com/antoniopelusi/chesSLM/).
+
+### Set temperature
+
+By default, the model run with a `temperature` of `0.0`.
+
+To run with a custom `temperature`, for example `0.3`:
+
+```sh
+./chesSLM --temperature 0.3
+```
