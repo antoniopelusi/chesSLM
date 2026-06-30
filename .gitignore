@@ -9,3 +9,5 @@ chesslm_data_s2_val
 chesslm_vocab.json
 
 chesslm_model.pt
+
+Cute_Chess*.AppImage
