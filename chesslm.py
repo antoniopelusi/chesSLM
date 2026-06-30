@@ -30,6 +30,7 @@ def select_gpu():
 
 select_gpu()
 
+import argparse
 import json
 import math
 import random
@@ -520,10 +521,12 @@ def get_best_move(model, vocab, board, game_moves):
     pad_id = vocab[PAD_TOK]
     ids = [vocab[BOS_TOK]] + [vocab.get(m, pad_id) for m in game_moves]
     ids = ids[-CONTEXT_LEN:]
+    real_len = len(ids)
+    ids = ids + [pad_id] * (CONTEXT_LEN - real_len)
     x = torch.tensor([ids], dtype=torch.long, device=DEVICE)
 
     with torch.inference_mode():
-        logits = model(x)[0, -1]
+        logits = model(x)[0, real_len - 1]
 
     legal_map = {board.san(m).rstrip("+#"): m for m in board.legal_moves}
     legal_tokens = [
@@ -607,6 +610,17 @@ def uci_loop(model, vocab):
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
+def warmup_model(model, vocab):
+    log("Warming up model (JIT compilation)...")
+    board = chess.Board()
+    game_moves = []
+    for _ in range(3):
+        _ = get_best_move(model, vocab, board, game_moves)
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    log("Warmup complete — model ready")
+
+
 def _new_model(vocab_size):
     return ChesSLM(
         vocab_size, D_MODEL, N_HEADS, N_LAYERS, D_FF, CONTEXT_LEN, DROPOUT
@@ -673,6 +687,16 @@ def load_or_build_data():
 
 
 def main():
+    global TEMPERATURE
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature (0.0 = greedy)",
+    )
+    args, _ = parser.parse_known_args()
+    TEMPERATURE = args.temperature
     set_seed(SEED)
 
     # ── final model already exists ────────────────────────────────────────────
@@ -686,8 +710,11 @@ def main():
         params = sum(p.numel() for p in raw_model.parameters())
         log(f"- Vocab: {len(vocab):,}")
         log(f"- tokens Model: {params:,} parameters")
-        log(f"- Device: {DEVICE}\n")
+        log(f"- Device: {DEVICE}")
+        log(f"- Temperature: {TEMPERATURE}\n")
+
         model.eval()
+        warmup_model(model, vocab)
         log("ChesSLM ready — entering UCI loop")
         uci_loop(model, vocab)
         return
@@ -763,6 +790,7 @@ def main():
     log(f"Final model saved: {MODEL_PATH}")
 
     model.eval()
+    warmup_model(model, vocab)
     log("ChesSLM ready — entering UCI loop")
     uci_loop(model, vocab)
 

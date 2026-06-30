@@ -1,5 +1,5 @@
-.PHONY: all setup clean run
-.SILENT: all setup clean run
+.PHONY: all setup clean
+.SILENT: all setup clean
 
 VENV = .venv
 PYTHON = $(VENV)/bin/python
@@ -15,6 +15,3 @@ setup:
 
 clean:
 	rm -rf $(VENV)
-
-run:
-	./run.sh

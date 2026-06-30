@@ -1,5 +1,7 @@
 # ChesSLM — A GPT-Style Language Model That Plays Chess
 
+> Level: `Stockfish ~1650 ELO` on temperature 0.0
+
 ChesSLM is a single self-contained Python script that trains a small
 **decoder-only Transformer** (architecturally a scaled-down GPT-2) to predict
 chess moves, and then serves the trained model as a chess engine over the
@@ -30,10 +32,11 @@ training → inference → deployment.
 6. [Training mechanics](#6-training-mechanics)
 7. [Checkpointing, caching and resumability](#7-checkpointing-caching-and-resumability)
 8. [Inference and legality enforcement](#8-inference-and-legality-enforcement)
-9. [Serving the model: the UCI loop](#9-serving-the-model-the-uci-loop)
-10. [Files produced by the pipeline](#10-files-produced-by-the-pipeline)
-11. [Hyperparameter reference](#11-hyperparameter-reference)
-12. [How to run it](#12-how-to-run-it)
+9. [Model warmup](#9-model-warmup)
+10. [Serving the model: the UCI loop](#10-serving-the-model-the-uci-loop)
+11. [Files produced by the pipeline](#11-files-produced-by-the-pipeline)
+12. [Hyperparameter reference](#12-hyperparameter-reference)
+13. [How to run it](#13-how-to-run-it)
 
 ---
 
@@ -74,7 +77,7 @@ redoing finished work.
                              │         (finetuning)
                              └──────┬────────┘
                                     │
-                          Save final model, serve over UCI
+                          Save final model, warm up, serve over UCI
 ```
 
 There are three independent "checkpoints" gating the pipeline:
@@ -113,7 +116,7 @@ Two normalization choices keep this vocabulary clean and small:
   head are reused — and fine-tuned — across both stages.
 
 Three special tokens complete the vocabulary: `<bos>` (beginning of a
-game), `<eos>` (end of a game), and `<pad>` (reserved for padding.
+game), `<eos>` (end of a game), and `<pad>` (reserved for padding).
 
 Because the vocabulary is derived from the *finite* set of move strings
 actually observed in the dataset (not the combinatorial space of every
@@ -456,7 +459,37 @@ the two is what gets played.
 
 ---
 
-## 9. Serving the model: the UCI loop
+## 9. Model warmup
+
+`warmup_model()` runs three throwaway forward passes through `get_best_move()`
+on a fresh starting position **before** the engine starts listening for UCI
+commands. This exists purely to absorb a one-off cost that would otherwise
+hit the *first real* `go` command: `torch.compile()` only traces and
+compiles its fused kernels the first time the model is actually invoked
+with a given input shape, and (on CUDA) that first invocation also pays for
+context/kernel initialization. Without warmup, the GUI's very first move
+request would stall for several seconds while this compilation happens;
+running it eagerly at startup instead moves that cost to before the engine
+announces it is ready.
+
+On CUDA devices, `torch.cuda.synchronize()` is called after the warmup
+passes to make sure the asynchronous GPU work has actually finished (and
+not just been queued) before logging that warmup is complete.
+
+Warmup runs in both startup paths: when a previously-trained model is
+loaded straight from disk, and immediately after training finishes and the
+model is about to be served for the first time — so the JIT-compilation
+delay is absorbed exactly once, regardless of which path led to serving.
+
+Note this is unrelated to the learning-rate *warmup* described in
+[§6.4](#64-learning-rate-schedule) (`S1_WARMUP`/`S2_WARMUP`) — that warmup
+shapes the optimizer's LR schedule during training; this warmup is a
+one-time inference-side JIT/CUDA priming step that runs only at serving
+startup, never during training.
+
+---
+
+## 10. Serving the model: the UCI loop
 
 `uci_loop()` implements the subset of the
 [UCI protocol](https://www.chessprogramming.org/UCI) needed to plug
@@ -481,7 +514,7 @@ immediately rather than waiting on OS-level output buffering.
 
 ---
 
-## 10. Files produced by the pipeline
+## 11. Files produced by the pipeline
 
 | Path (constant) | Contents |
 |---|---|
@@ -494,7 +527,7 @@ immediately rather than waiting on OS-level output buffering.
 
 ---
 
-## 11. Hyperparameter reference
+## 12. Hyperparameter reference
 
 | Category | Name | Value |
 |---|---|---|
@@ -525,7 +558,7 @@ immediately rather than waiting on OS-level output buffering.
 
 ---
 
-## 12. How to run it
+## 13. How to run it
 
 ### Requirements
 
@@ -543,19 +576,25 @@ visible, and gracefully falls back to CPU otherwise.
 
 ### First run (training from scratch)
 
-```bash
-python chesslm.py
+#### Run with temperature 0.0 (deterministic)
+```sh
+./chesSLM
+```
+
+#### Run with temperature 0.3
+```sh
+./chesSLM --temperature 0.3
 ```
 
 On a machine with no cached artifacts, this will: stream and filter the
 dataset, build the vocabulary, tokenize and cache everything, train Stage
-1, train Stage 2, save the final model, and then start listening on stdin
-for UCI commands.
+1, train Stage 2, save the final model, warm up the model, and then start
+listening on stdin for UCI commands.
 
 ### Subsequent runs (serving only)
 
 Once `chesslm_model.pt` and `chesslm_vocab.json` exist, simply running
 `python chesslm.py` again skips all of the above and immediately loads the
-trained model into a UCI engine, ready to be pointed at by any UCI-capable
-GUI (configure the GUI to use `python chesslm.py` as the engine's
-executable).
+trained model, runs the brief warmup pass, and starts a UCI engine, ready
+to be pointed at by any UCI-capable GUI (configure the GUI to use
+`python chesslm.py` as the engine's executable).
