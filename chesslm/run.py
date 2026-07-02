@@ -11,11 +11,17 @@ from .vocab import load_vocab
 
 
 def run_inference():
-    """Single-responsibility entry point for normal / engine usage.
+    """Load the trained model from disk and enter the UCI engine loop.
 
-    Requires MODEL_PATH and VOCAB_PATH to already exist on disk. It never
-    trains and never downloads anything — if the artifacts are missing this
-    is a hard error, pointing the user at `--train` or `--getmodel`.
+    Single-responsibility entry point for normal engine usage. Expects
+    ``config.MODEL_PATH`` and ``config.VOCAB_PATH`` to already exist on disk.
+    It never trains and never downloads anything — if the artefacts are missing
+    the function logs a helpful error message and exits with code 1, pointing
+    the user at ``--train`` or ``--getmodel``.
+
+    The model is loaded, wrapped with :func:`torch.compile`, and warmed up via
+    a dummy inference call before the UCI loop starts so that JIT compilation
+    overhead does not affect the first move response time.
     """
     if not (os.path.exists(config.MODEL_PATH) and os.path.exists(config.VOCAB_PATH)):
         log(

@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 
-from .paths import (  # noqa: F401  (re-exported for convenience)
+from .paths import (
     DATASET_ID,
     HF_REPO_ID,
     MODEL_PATH,

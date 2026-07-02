@@ -10,6 +10,31 @@ from .util import log
 
 
 def get_best_move(model, vocab, board, game_moves):
+    """Select the best legal move for the current position using the language model.
+
+    Builds a token-ID sequence from the game history, runs a forward pass, and
+    scores only the legal moves available in *board*. The move with the highest
+    score is returned when ``config.TEMPERATURE <= 0``; otherwise a move is
+    sampled proportionally to the softmax probabilities scaled by the
+    temperature. If none of the legal moves appear in the vocabulary, a random
+    legal move is chosen as a fallback.
+
+    The context is right-truncated to ``config.CONTEXT_LEN`` tokens and
+    left-padded with the PAD token so that the tensor always has the expected
+    fixed length.
+
+    Args:
+        model (torch.nn.Module): Compiled ChesSLM model in evaluation mode.
+        vocab (dict[str, int]): Token-to-index mapping produced by
+            :func:`~chesslm.vocab.build_vocab`.
+        board (chess.Board): Current board state, used to enumerate legal moves
+            and convert them to SAN notation.
+        game_moves (list[str]): SAN move strings played so far in the game
+            (without check/mate annotations), used to build the input context.
+
+    Returns:
+        str: UCI move string (e.g. ``"e2e4"``) for the selected move.
+    """
     pad_id = vocab[config.PAD_TOK]
     ids = [vocab[config.BOS_TOK]] + [vocab.get(m, pad_id) for m in game_moves]
     ids = ids[-config.CONTEXT_LEN :]
@@ -42,7 +67,20 @@ def get_best_move(model, vocab, board, game_moves):
 
 
 def warmup_model(model, vocab):
-    """Run a dummy inferences to trigger torch.compile JIT compilation."""
+    """Run a dummy inference to trigger ``torch.compile`` JIT compilation.
+
+    The first forward pass through a compiled model is slow because PyTorch
+    traces and compiles the computation graph. Calling this function before
+    entering the UCI loop amortises that cost so the engine is ready to
+    respond immediately when the GUI sends the first ``go`` command.
+
+    On CUDA devices a :func:`torch.cuda.synchronize` call is issued after the
+    dummy inference to ensure compilation has fully completed before returning.
+
+    Args:
+        model (torch.nn.Module): Compiled ChesSLM model in evaluation mode.
+        vocab (dict[str, int]): Token-to-index mapping.
+    """
     board = chess.Board()
     get_best_move(model, vocab, board, [])
     if config.DEVICE.type == "cuda":
@@ -50,6 +88,27 @@ def warmup_model(model, vocab):
 
 
 def uci_loop(model, vocab):
+    """Run the UCI (Universal Chess Interface) communication loop.
+
+    Reads commands from ``stdin`` line by line and writes responses to
+    ``stdout``, following the UCI protocol used by chess GUIs (e.g. Arena,
+    Cutechess, Lichess Bot). The supported commands are:
+
+    * ``uci`` — identify the engine and list options.
+    * ``setoption name Temperature value <v>`` — update ``config.TEMPERATURE``
+      at runtime without restarting the engine.
+    * ``isready`` — respond ``readyok`` to signal the engine is initialised.
+    * ``ucinewgame`` — reset the board and move history.
+    * ``position [startpos | fen <fen>] [moves <uci_moves>]`` — set up the
+      board from a starting position or FEN string and replay any moves.
+    * ``go`` — compute and print the best move in ``bestmove <uci>`` format.
+    * ``stop`` — acknowledged but no action is needed (search is synchronous).
+    * ``quit`` — exit the loop.
+
+    Args:
+        model (torch.nn.Module): Compiled ChesSLM model in evaluation mode.
+        vocab (dict[str, int]): Token-to-index mapping.
+    """
     board = chess.Board()
     game_moves = []
 

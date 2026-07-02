@@ -11,6 +11,22 @@ from .vocab import build_token_stream, build_vocab, load_vocab, save_vocab
 
 
 def download_games(min_elo):
+    """Stream the Hugging Face dataset and collect games above a minimum ELO threshold.
+
+    Iterates over the full streaming split in a single pass, discarding samples
+    where either player's ELO is missing or below *min_elo*, and where the game
+    is shorter than 10 half-moves. Move annotations (check '+' and mate '#')
+    are stripped from each SAN token before storing.
+
+    Args:
+        min_elo (int): Minimum ELO for both players. Games where either player
+            is below this value are skipped.
+
+    Returns:
+        list[tuple[int, list[str]]]: A list of ``(elo, moves)`` pairs where
+            *elo* is the lower of the two players' ratings and *moves* is the
+            list of cleaned SAN move strings.
+    """
     log(f"Streaming dataset: {config.DATASET_ID} (ELO >= {min_elo}) ...")
     ds = load_dataset(config.DATASET_ID, split="train", streaming=True)
     games = []
@@ -41,6 +57,21 @@ def download_games(min_elo):
 
 
 def split_games(games, val_fraction, seed):
+    """Split a list of games into train and validation subsets.
+
+    The split is reproducible via *seed*. If fewer than 20 games are provided
+    the entire collection is returned as the training set and the validation
+    set is empty, avoiding degenerate splits on tiny datasets.
+
+    Args:
+        games (list): Game records (any element type) to split.
+        val_fraction (float): Fraction of games to place in the validation set,
+            e.g. ``0.05`` for 5 %.
+        seed (int): Random seed used to shuffle indices before splitting.
+
+    Returns:
+        tuple[list, list]: ``(train_games, val_games)``
+    """
     if len(games) < 20:
         return games, []
     rng = random.Random(seed)
@@ -54,12 +85,34 @@ def split_games(games, val_fraction, seed):
 
 
 def _atomic_tensor_save(tensor, path):
+    """Save a PyTorch tensor to *path* atomically via a temporary file.
+
+    Writes to ``path + ".tmp"`` first and then uses :func:`os.replace` for an
+    atomic rename, so a partially-written file is never visible at *path*.
+
+    Args:
+        tensor (torch.Tensor): Tensor to persist.
+        path (str): Destination file path.
+    """
     tmp = path + ".tmp"
     torch.save(tensor, tmp)
     os.replace(tmp, path)
 
 
 class ChessDataset(Dataset):
+    """PyTorch ``Dataset`` over a flat token-ID stream for next-token prediction.
+
+    The stream is split into non-overlapping context windows of length
+    ``config.CONTEXT_LEN``. Each item returns an ``(x, y)`` pair where *x* is
+    the input window and *y* is the same window shifted one position to the
+    right, suitable for language-model training with cross-entropy loss.
+
+    Args:
+        data (torch.Tensor): 1-D tensor of token IDs (the full concatenated
+            token stream).
+        ctx (int): Context length (sequence length for each sample).
+    """
+
     def __init__(self, data, ctx):
         n = (len(data) - 1) // ctx
         self.data = data[: n * ctx + 1]
@@ -67,15 +120,41 @@ class ChessDataset(Dataset):
         self.n = n
 
     def __len__(self):
+        """Return the number of non-overlapping context windows in the stream."""
         return self.n
 
     def __getitem__(self, idx):
+        """Return the input/target pair for window *idx*.
+
+        Args:
+            idx (int): Window index in ``[0, len(self))``.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: ``(x, y)`` each of shape
+                ``(ctx,)``, where ``y[i] == x[i + 1]``.
+        """
         s = idx * self.ctx
         chunk = self.data[s : s + self.ctx + 1]
         return chunk[:-1].clone(), chunk[1:].clone()
 
 
 def make_loader(data, batch_size, train):
+    """Wrap a token-ID tensor in a :class:`ChessDataset` and return a DataLoader.
+
+    Returns ``None`` if the resulting dataset would be empty (e.g. when the
+    token stream is shorter than one context window).
+
+    Args:
+        data (torch.Tensor): 1-D token-ID tensor.
+        batch_size (int): Number of sequences per batch.
+        train (bool): Whether to shuffle and drop the last incomplete batch.
+            When ``False`` (validation) the data is iterated in order without
+            dropping samples.
+
+    Returns:
+        torch.utils.data.DataLoader | None: Configured loader, or ``None`` if
+            the dataset is empty.
+    """
     dataset = ChessDataset(data, config.CONTEXT_LEN)
     if len(dataset) == 0:
         return None
@@ -95,6 +174,24 @@ def make_loader(data, batch_size, train):
 
 
 def load_or_build_data():
+    """Load pre-processed data from disk or build it from scratch.
+
+    Checks whether all five cache files (vocab, stage-1 train/val tensors,
+    stage-2 train/val tensors) already exist. If they do, they are loaded
+    directly; otherwise the Hugging Face dataset is streamed, the vocabulary
+    is built, games are tokenised, and all artefacts are written atomically to
+    the paths defined in :mod:`config`.
+
+    The dataset download is performed in a *single* streaming pass: games are
+    partitioned into the two ELO bands (stage 1 and stage 2) during the same
+    pass that collects them.
+
+    Returns:
+        tuple: ``(vocab, s1_train, s1_val, s2_train, s2_val)`` where *vocab*
+            is the token-to-index mapping (dict) and the remaining four
+            elements are 1-D :class:`torch.Tensor` objects containing token
+            IDs for each split.
+    """
     caches = [
         config.VOCAB_PATH,
         config.S1_TRAIN_CACHE,

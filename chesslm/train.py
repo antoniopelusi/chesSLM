@@ -14,6 +14,23 @@ from .util import log
 
 
 def cosine_lr(step, total, warmup, max_lr, min_lr=None):
+    """Compute the learning rate for *step* using a linear warmup + cosine decay schedule.
+
+    During the warmup phase (``step < warmup``) the learning rate increases
+    linearly from 0 to *max_lr*. After warmup it follows a cosine curve that
+    decays from *max_lr* down to *min_lr* over the remaining steps.
+
+    Args:
+        step (int): Current optimiser step (1-indexed).
+        total (int): Total number of optimiser steps for the run.
+        warmup (int): Number of warmup steps.
+        max_lr (float): Peak learning rate reached at the end of warmup.
+        min_lr (float | None): Minimum learning rate at the end of the cosine
+            decay. Defaults to ``config.MIN_LR`` when ``None``.
+
+    Returns:
+        float: Learning rate to apply at *step*.
+    """
     min_lr = config.MIN_LR if min_lr is None else min_lr
     if step < warmup:
         return max_lr * step / max(warmup, 1)
@@ -22,6 +39,18 @@ def cosine_lr(step, total, warmup, max_lr, min_lr=None):
 
 
 def _make_amp_config():
+    """Determine the automatic mixed precision (AMP) settings for the current device.
+
+    On CPU, AMP is disabled and full ``float32`` precision is used. On CUDA
+    devices, ``bfloat16`` is preferred when the hardware supports it (Ampere+);
+    otherwise ``float16`` is used together with a :class:`torch.amp.GradScaler`
+    to prevent gradient underflow.
+
+    Returns:
+        tuple[bool, torch.dtype, torch.amp.GradScaler | None]:
+            ``(use_amp, amp_dtype, scaler)`` where *scaler* is ``None`` unless
+            ``float16`` is used.
+    """
     if config.DEVICE.type != "cuda":
         return False, torch.float32, None
     if torch.cuda.is_bf16_supported():
@@ -30,6 +59,20 @@ def _make_amp_config():
 
 
 def _make_param_groups(model, weight_decay):
+    """Split model parameters into weight-decayed and non-decayed groups.
+
+    Following common practice, weight decay is applied only to 2-D+ parameter
+    tensors (i.e. weight matrices), while 1-D parameters such as biases and
+    layer-norm scales are excluded from regularisation.
+
+    Args:
+        model (torch.nn.Module): The model whose parameters are to be grouped.
+        weight_decay (float): L2 regularisation coefficient for the decay group.
+
+    Returns:
+        list[dict]: Two-element list of parameter-group dicts ready to pass to
+            :class:`torch.optim.AdamW`.
+    """
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -45,6 +88,28 @@ def _make_param_groups(model, weight_decay):
 
 
 def _step_optimizer(params, optimizer, scaler, opt_step, total_steps, max_lr, warmup):
+    """Advance the optimiser by one step with gradient clipping and LR scheduling.
+
+    Increments *opt_step*, computes the target LR via :func:`cosine_lr`,
+    updates all parameter-group LRs, clips gradients, and calls
+    ``optimizer.step()`` (through the scaler when using ``float16`` AMP).
+    Gradients are zeroed after the update.
+
+    Args:
+        params (list[torch.nn.Parameter]): All model parameters, used for
+            gradient norm clipping.
+        optimizer (torch.optim.Optimizer): The optimiser to step.
+        scaler (torch.amp.GradScaler | None): Gradient scaler for ``float16``
+            AMP; ``None`` when not in use.
+        opt_step (int): Optimiser step counter *before* this update.
+        total_steps (int): Total planned optimiser steps (for LR scheduling).
+        max_lr (float): Peak learning rate for the cosine schedule.
+        warmup (int): Number of warmup steps.
+
+    Returns:
+        tuple[int, float]: ``(opt_step + 1, lr)`` — the updated step counter
+            and the learning rate that was applied.
+    """
     opt_step += 1
     lr = cosine_lr(opt_step, total_steps, warmup, max_lr)
     for pg in optimizer.param_groups:
@@ -63,6 +128,22 @@ def _step_optimizer(params, optimizer, scaler, opt_step, total_steps, max_lr, wa
 
 @torch.inference_mode()
 def evaluate(model, loader, pad_id):
+    """Compute the average cross-entropy loss over the validation set.
+
+    Iterates the entire validation loader once without computing gradients.
+    The PAD token is masked out via ``ignore_index`` so padding positions do
+    not contribute to the loss. Returns ``float('nan')`` when the loader is
+    ``None`` or empty (e.g. when no validation data is available).
+
+    Args:
+        model (torch.nn.Module): Model to evaluate.
+        loader (torch.utils.data.DataLoader | None): Validation data loader.
+        pad_id (int): Token ID of the PAD token to ignore in the loss.
+
+    Returns:
+        float: Mean cross-entropy loss over all validation batches, or
+            ``float('nan')`` if no batches are available.
+    """
     if loader is None or len(loader) == 0:
         return float("nan")
     use_amp, amp_dtype, _ = _make_amp_config()
@@ -96,6 +177,39 @@ def train_model(
     eval_interval=None,
     patience=None,
 ):
+    """Train *model* for the given number of epochs with optional early stopping.
+
+    Supports gradient accumulation, AMP, cosine LR scheduling, and periodic
+    validation with best-checkpoint saving. When a validation loader is
+    provided, the best checkpoint (lowest validation loss) is saved atomically
+    to *best_ckpt_path* and restored at the end of training. When no
+    validation data is available the final weights are saved instead.
+
+    Early stopping halts training when validation loss has not improved by at
+    least 1e-4 for *patience* consecutive evaluations.
+
+    Args:
+        model (torch.nn.Module): Compiled model used for forward/backward passes.
+        raw_model (torch.nn.Module): Underlying (non-compiled) model whose
+            ``state_dict`` is saved to disk and whose parameters are passed to
+            the optimiser.
+        train_loader (torch.utils.data.DataLoader): Training data loader.
+        val_loader (torch.utils.data.DataLoader | None): Validation data
+            loader, or ``None`` to skip validation.
+        vocab (dict[str, int]): Token vocabulary (used to look up the PAD
+            token ID).
+        epochs (int): Maximum number of full passes over the training data.
+        total_steps (int): Total optimiser steps (for LR scheduling).
+        max_lr (float): Peak learning rate.
+        warmup (int): Number of linear warmup steps.
+        best_ckpt_path (str): File path where the best model checkpoint is
+            written.
+        eval_interval (int | None): How many optimiser steps between mid-epoch
+            validation runs. Defaults to ``config.EVAL_INTERVAL_STEPS``.
+        patience (int | None): Number of consecutive evaluations without
+            improvement before early stopping is triggered. Defaults to
+            ``config.EARLY_STOP_PATIENCE``.
+    """
     eval_interval = (
         config.EVAL_INTERVAL_STEPS if eval_interval is None else eval_interval
     )
@@ -117,6 +231,7 @@ def train_model(
     stop = False
 
     def check_val(tag):
+        """Evaluate on the validation set, save the checkpoint if improved, and check early stopping."""
         nonlocal best_val, no_improve, stop
         val_loss = evaluate(model, val_loader, pad_id)
         improved = val_loss < best_val - 1e-4
@@ -216,6 +331,16 @@ def train_model(
 
 
 def _log_stage(tag, train_loader, val_loader, total_steps, warmup):
+    """Log a summary line with dataset sizes and training hyperparameters for a stage.
+
+    Args:
+        tag (str): Stage label used as a prefix in the log output.
+        train_loader (torch.utils.data.DataLoader): Training data loader.
+        val_loader (torch.utils.data.DataLoader | None): Validation data
+            loader, or ``None`` if no validation data is available.
+        total_steps (int): Total optimiser steps planned for the stage.
+        warmup (int): Number of warmup steps for the stage.
+    """
     val_chunks = len(val_loader.dataset) if val_loader is not None else 0
     log(
         f"[{tag}]"
@@ -232,6 +357,26 @@ def _log_stage(tag, train_loader, val_loader, total_steps, warmup):
 def _run_stage(
     tag, model, raw_model, train_data, val_data, vocab, epochs, lr, warmup, ckpt_path
 ):
+    """Run a single training stage, or skip it if its checkpoint already exists.
+
+    If *ckpt_path* is present on disk the stage is considered complete: the
+    saved weights are loaded into *raw_model* and the function returns
+    immediately without re-training. This allows an interrupted multi-stage
+    run to resume from the last completed stage.
+
+    Args:
+        tag (str): Human-readable stage name used in log output.
+        model (torch.nn.Module): Compiled model for forward/backward passes.
+        raw_model (torch.nn.Module): Underlying (non-compiled) model.
+        train_data (torch.Tensor): 1-D token-ID tensor for training.
+        val_data (torch.Tensor): 1-D token-ID tensor for validation.
+        vocab (dict[str, int]): Token vocabulary.
+        epochs (int): Maximum number of epochs for this stage.
+        lr (float): Peak learning rate for this stage.
+        warmup (int): Number of warmup steps for this stage.
+        ckpt_path (str): Path where the best checkpoint for this stage is
+            saved (and checked for an existing run).
+    """
     if os.path.exists(ckpt_path):
         log(f"[{tag}] checkpoint found — skipping ...")
         raw_model.load_state_dict(
@@ -261,12 +406,22 @@ def _run_stage(
 
 
 def run_train():
-    """Single-responsibility entry point for the one-off training flow.
+    """Execute the full two-stage training pipeline from scratch.
 
-    Refuses to run if a final trained model is already present (training is
-    meant to be a once-and-done operation) — remove the artifacts first if a
-    retrain is really wanted. Intermediate per-stage checkpoints are still
-    reused to allow resuming an interrupted run.
+    Single-responsibility entry point for the one-off training flow. Refuses
+    to run if a final trained model is already present — training is meant to
+    be a once-and-done operation; remove the artefacts first if a full retrain
+    is really wanted. Intermediate per-stage checkpoints are still reused to
+    allow resuming an interrupted run.
+
+    Stage 1 (pre-training) trains on games in the ELO range
+    ``[S1_MIN_ELO, S2_MIN_ELO)`` with a higher learning rate and more epochs
+    to build general chess knowledge. Stage 2 (fine-tuning) continues on
+    high-ELO games (``>= S2_MIN_ELO``) with a lower learning rate to
+    specialise the model towards stronger play.
+
+    At the end the final state dict is written atomically to
+    ``config.MODEL_PATH``.
     """
     if os.path.exists(config.MODEL_PATH) or os.path.exists(config.VOCAB_PATH):
         log(f"ERROR: {config.MODEL_PATH} and/or {config.VOCAB_PATH} already exist.")

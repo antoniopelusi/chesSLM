@@ -1,16 +1,23 @@
 #!/usr/bin/env -S ./.venv/bin/python -u
 """
 ChesSLM — entry point
-  (default)      load model and enter UCI inference loop
-  --train        train the model from scratch (or resume interrupted run)
-  --getmodel     download pretrained weights from Hugging Face
+
+Dispatches to one of three mutually exclusive modes based on CLI flags:
+
+* ``(default)``  Load the trained model and enter the UCI inference loop.
+* ``--train``    Train the model from scratch (or resume an interrupted run).
+* ``--getmodel`` Download pretrained weights and vocabulary from Hugging Face.
+
+All heavy imports (PyTorch, the chesslm package) are deferred until after GPU
+selection and CLI parsing so that ``--getmodel`` never triggers a CUDA
+initialisation and ``--help`` is instantaneous.
 """
 
 import os
 import shutil
 import sys
 
-# ── CUDA env must be set before any torch import ──────────────────────────────
+# CUDA env must be set before any torch import
 _cuda_lib = "/usr/local/cuda/lib64"
 if _cuda_lib not in os.environ.get("LD_LIBRARY_PATH", ""):
     os.environ["LD_LIBRARY_PATH"] = (
@@ -19,13 +26,13 @@ if _cuda_lib not in os.environ.get("LD_LIBRARY_PATH", ""):
 os.environ["CUDA_HOME"] = "/usr/local/cuda"
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# ── GPU selection (before torch.device is evaluated in config) ────────────────
-from chesslm.util import log, select_gpu  # noqa: E402
+# GPU selection must happen before torch.device is evaluated in config
+from chesslm.util import log, select_gpu
 
 select_gpu()
 
-# ── CLI parsing (lightweight — no torch needed for --getmodel) ────────────────
-import argparse  # noqa: E402
+# CLI parsing (lightweight — no torch needed for --getmodel)
+import argparse
 
 parser = argparse.ArgumentParser(prog="chesSLM", add_help=True)
 group = parser.add_mutually_exclusive_group()
@@ -38,7 +45,7 @@ group.add_argument(
 args = parser.parse_args()
 
 
-# ── --getmodel branch (no torch, no GPU needed) ───────────────────────────────
+# --getmodel branch (no torch, no GPU needed)
 if args.getmodel:
     from huggingface_hub import hf_hub_download
 
@@ -50,8 +57,7 @@ if args.getmodel:
             continue
         log(f"Downloading {filename} from {HF_REPO_ID} ...")
         downloaded = hf_hub_download(repo_id=HF_REPO_ID, filename=filename)
-        # hf_hub_download caches to ~/.cache; copy to working directory.
-
+        # hf_hub_download caches to ~/.cache; copy to the working directory.
         shutil.copy(downloaded, local_path)
         log(f"Saved: {local_path}")
 
@@ -59,7 +65,7 @@ if args.getmodel:
     sys.exit(0)
 
 
-# ── --train branch ────────────────────────────────────────────────────────────
+# --train branch
 if args.train:
     from chesslm.train import run_train
 
@@ -67,7 +73,7 @@ if args.train:
     sys.exit(0)
 
 
-# ── default branch: inference / UCI engine ────────────────────────────────────
+# Default branch: inference / UCI engine
 from chesslm.run import run_inference
 
 run_inference()
