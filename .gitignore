@@ -1,5 +1,7 @@
 .venv
 
+__pycache__
+
 chesslm_data_s1_train
 chesslm_data_s2_train
 
