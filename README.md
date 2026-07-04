@@ -1,4 +1,5 @@
-# ChesSLM
+# ♟️ chesSLM
+Chess **S**mall **L**anguage **M**odel
 
 > Level: Stockfish ~1650 ELO on temperature 0.0
 
