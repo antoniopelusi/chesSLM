@@ -19,9 +19,13 @@ def get_best_move(model, vocab, board, game_moves):
     temperature. If none of the legal moves appear in the vocabulary, a random
     legal move is chosen as a fallback.
 
-    The context is right-truncated to ``config.CONTEXT_LEN`` tokens and
-    left-padded with the PAD token so that the tensor always has the expected
-    fixed length.
+    Only the most recent ``config.CONTEXT_LEN`` tokens are kept — older moves
+    are dropped from the front if the game so far is longer than that — and
+    the result is then right-padded with the PAD token so the tensor always
+    has the expected fixed length. Right-padding (rather than left) matters
+    here: under causal attention the read-out position (the last real token)
+    never attends forward into the padding, so the untrained PAD embedding
+    never influences the returned logits.
 
     Args:
         model (torch.nn.Module): Compiled ChesSLM model in evaluation mode.

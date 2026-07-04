@@ -1,11 +1,8 @@
 import math
 import os
-import sys
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import autocast
 
 from . import config
 from .data import load_or_build_data, make_loader
@@ -13,226 +10,224 @@ from .model import new_model
 from .util import log
 
 
-def cosine_lr(step, total, warmup, max_lr, min_lr=None):
-    """Compute the learning rate for *step* using a linear warmup + cosine decay schedule.
-
-    During the warmup phase (``step < warmup``) the learning rate increases
-    linearly from 0 to *max_lr*. After warmup it follows a cosine curve that
-    decays from *max_lr* down to *min_lr* over the remaining steps.
+def cosine_lr(step, total_steps, warmup_steps, max_lr, min_lr):
+    """Compute the learning rate at *step* under a linear-warmup, cosine-decay schedule.
 
     Args:
-        step (int): Current optimiser step (1-indexed).
-        total (int): Total number of optimiser steps for the run.
-        warmup (int): Number of warmup steps.
+        step (int): Current optimizer step (1-indexed).
+        total_steps (int): Total number of optimizer steps for this stage.
+        warmup_steps (int): Number of linear warmup steps.
         max_lr (float): Peak learning rate reached at the end of warmup.
-        min_lr (float | None): Minimum learning rate at the end of the cosine
-            decay. Defaults to ``config.MIN_LR`` when ``None``.
+        min_lr (float): Floor learning rate at the end of the cosine decay.
 
     Returns:
-        float: Learning rate to apply at *step*.
+        float: Learning rate for *step*.
     """
-    min_lr = config.MIN_LR if min_lr is None else min_lr
-    if step < warmup:
-        return max_lr * step / max(warmup, 1)
-    t = (step - warmup) / max(total - warmup, 1)
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * t))
+    if step < warmup_steps:
+        return max_lr * step / max(1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(1.0, progress)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def _make_amp_config():
-    """Determine the automatic mixed precision (AMP) settings for the current device.
+    """Select the best available autocast dtype and matching GradScaler for this device.
 
-    On CPU, AMP is disabled and full ``float32`` precision is used. On CUDA
-    devices, ``bfloat16`` is preferred when the hardware supports it (Ampere+);
-    otherwise ``float16`` is used together with a :class:`torch.amp.GradScaler`
-    to prevent gradient underflow.
+    Prefers ``bfloat16`` on CUDA devices that support it (no scaler needed,
+    since bf16's exponent range matches fp32 closely enough to avoid
+    underflow). Falls back to ``float16`` with an active
+    :class:`torch.cuda.amp.GradScaler` on older CUDA devices. AMP is disabled
+    entirely on CPU.
 
     Returns:
-        tuple[bool, torch.dtype, torch.amp.GradScaler | None]:
-            ``(use_amp, amp_dtype, scaler)`` where *scaler* is ``None`` unless
-            ``float16`` is used.
+        tuple[torch.dtype | None, torch.cuda.amp.GradScaler | None]:
+            ``(autocast_dtype, scaler)``. Both are ``None`` on CPU.
     """
     if config.DEVICE.type != "cuda":
-        return False, torch.float32, None
+        return None, None
     if torch.cuda.is_bf16_supported():
-        return True, torch.bfloat16, None
-    return True, torch.float16, torch.amp.GradScaler("cuda")
+        return torch.bfloat16, None
+    return torch.float16, torch.cuda.amp.GradScaler()
 
 
-def _make_param_groups(model, weight_decay):
-    """Split model parameters into weight-decayed and non-decayed groups.
+def _make_param_groups(model):
+    """Split model parameters into decayed and non-decayed optimizer groups.
 
-    Following common practice, weight decay is applied only to 2-D+ parameter
-    tensors (i.e. weight matrices), while 1-D parameters such as biases and
-    layer-norm scales are excluded from regularisation.
+    Parameters with fewer than 2 dimensions (biases, LayerNorm weight/gain)
+    are exempt from weight decay, following standard GPT-2/nanoGPT practice.
+    All 2-D+ parameters — including the tied token embedding/output matrix —
+    are penalized with ``config.WEIGHT_DECAY``.
 
     Args:
-        model (torch.nn.Module): The model whose parameters are to be grouped.
-        weight_decay (float): L2 regularisation coefficient for the decay group.
+        model (torch.nn.Module): Model to collect parameters from.
 
     Returns:
-        list[dict]: Two-element list of parameter-group dicts ready to pass to
-            :class:`torch.optim.AdamW`.
+        list[dict]: Two parameter-group dicts suitable for ``torch.optim.AdamW``.
     """
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.dim() <= 1 or "bias" in name:
+        if p.dim() < 2 or "bias" in name:
             no_decay.append(p)
         else:
             decay.append(p)
     return [
-        {"params": decay, "weight_decay": weight_decay},
+        {"params": decay, "weight_decay": config.WEIGHT_DECAY},
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
 
-def _step_optimizer(params, optimizer, scaler, opt_step, total_steps, max_lr, warmup):
-    """Advance the optimiser by one step with gradient clipping and LR scheduling.
+def _step_optimizer(
+    optimizer, scaler, all_params, opt_step, total_steps, warmup, max_lr
+):
+    """Apply gradient clipping and one optimizer step, then zero gradients.
 
-    Increments *opt_step*, computes the target LR via :func:`cosine_lr`,
-    updates all parameter-group LRs, clips gradients, and calls
-    ``optimizer.step()`` (through the scaler when using ``float16`` AMP).
-    Gradients are zeroed after the update.
+    Handles both the GradScaler (fp16) and scaler-free (bf16/CPU) paths:
+    gradients are unscaled before clipping only when a scaler is active.
 
     Args:
-        params (list[torch.nn.Parameter]): All model parameters, used for
-            gradient norm clipping.
-        optimizer (torch.optim.Optimizer): The optimiser to step.
-        scaler (torch.amp.GradScaler | None): Gradient scaler for ``float16``
-            AMP; ``None`` when not in use.
-        opt_step (int): Optimiser step counter *before* this update.
-        total_steps (int): Total planned optimiser steps (for LR scheduling).
-        max_lr (float): Peak learning rate for the cosine schedule.
-        warmup (int): Number of warmup steps.
+        optimizer (torch.optim.Optimizer): Optimizer to step.
+        scaler (torch.cuda.amp.GradScaler | None): Active GradScaler, or
+            ``None`` if not using fp16 loss scaling.
+        all_params (list[torch.nn.Parameter]): All model parameters, used
+            for gradient norm clipping.
+        opt_step (int): Optimizer step counter *before* this step (will be
+            incremented and returned).
+        total_steps (int): Total steps for this stage's LR schedule.
+        warmup (int): Warmup steps for this stage's LR schedule.
+        max_lr (float): Peak LR for this stage's LR schedule.
 
     Returns:
-        tuple[int, float]: ``(opt_step + 1, lr)`` — the updated step counter
-            and the learning rate that was applied.
+        tuple[int, float]: ``(new_opt_step, lr_used)``.
     """
     opt_step += 1
-    lr = cosine_lr(opt_step, total_steps, warmup, max_lr)
-    for pg in optimizer.param_groups:
-        pg["lr"] = lr
+    lr = cosine_lr(opt_step, total_steps, warmup, max_lr, config.MIN_LR)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
     if scaler is not None:
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(params, config.GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(all_params, config.GRAD_CLIP)
         scaler.step(optimizer)
         scaler.update()
     else:
-        nn.utils.clip_grad_norm_(params, config.GRAD_CLIP)
+        torch.nn.utils.clip_grad_norm_(all_params, config.GRAD_CLIP)
         optimizer.step()
+
     optimizer.zero_grad(set_to_none=True)
     return opt_step, lr
 
 
-@torch.inference_mode()
-def evaluate(model, loader, pad_id):
-    """Compute the average cross-entropy loss over the validation set.
+@torch.no_grad()
+def evaluate(model, val_loader, pad_id):
+    """Compute mean cross-entropy loss over a validation loader.
 
-    Iterates the entire validation loader once without computing gradients.
-    The PAD token is masked out via ``ignore_index`` so padding positions do
-    not contribute to the loss. Returns ``float('nan')`` when the loader is
-    ``None`` or empty (e.g. when no validation data is available).
+    Label smoothing is deliberately disabled here (unlike the training loss)
+    so the reported metric is a calibration-comparable measure to track
+    across evaluations, uninflated by the smoothing term used to regularise
+    training. Padding/orphan-fragment positions are excluded via
+    ``ignore_index=pad_id``, matching the training loss's masking.
 
     Args:
-        model (torch.nn.Module): Model to evaluate.
-        loader (torch.utils.data.DataLoader | None): Validation data loader.
-        pad_id (int): Token ID of the PAD token to ignore in the loss.
+        model (torch.nn.Module): Model to evaluate (switched to eval mode
+            internally and restored to train mode before returning).
+        val_loader (torch.utils.data.DataLoader): Validation data loader.
+        pad_id (int): Token ID to ignore in the loss (padding / orphan
+            fragments).
 
     Returns:
-        float: Mean cross-entropy loss over all validation batches, or
-            ``float('nan')`` if no batches are available.
+        float: Mean per-token cross-entropy loss over the validation set.
     """
-    if loader is None or len(loader) == 0:
-        return float("nan")
-    use_amp, amp_dtype, _ = _make_amp_config()
     model.eval()
-    total, n = 0.0, 0
-    for x, y in loader:
-        x, y = x.to(config.DEVICE), y.to(config.DEVICE)
-        with autocast(device_type=config.DEVICE.type, dtype=amp_dtype, enabled=use_amp):
+    total_loss = 0.0
+    total_tokens = 0
+    autocast_dtype, _ = _make_amp_config()
+    for x, y in val_loader:
+        x, y = (
+            x.to(config.DEVICE, non_blocking=True),
+            y.to(config.DEVICE, non_blocking=True),
+        )
+        ctx = (
+            torch.autocast(device_type=config.DEVICE.type, dtype=autocast_dtype)
+            if autocast_dtype is not None
+            else torch.no_grad()
+        )
+        with ctx:
             logits = model(x)
-            B, T, V = logits.shape
             loss = F.cross_entropy(
-                logits.view(B * T, V), y.view(B * T), ignore_index=pad_id
+                logits.view(-1, logits.size(-1)),
+                y.view(-1),
+                ignore_index=pad_id,
+                reduction="sum",
             )
-        total += loss.item()
-        n += 1
+        n_valid = (y != pad_id).sum().item()
+        total_loss += loss.item()
+        total_tokens += max(1, n_valid)
     model.train()
-    return total / max(n, 1)
+    return total_loss / max(1, total_tokens)
 
 
 def train_model(
-    model,
     raw_model,
+    model,
     train_loader,
     val_loader,
-    vocab,
     epochs,
-    total_steps,
     max_lr,
     warmup,
+    pad_id,
     best_ckpt_path,
-    eval_interval=None,
-    patience=None,
+    patience,
 ):
-    """Train *model* for the given number of epochs with optional early stopping.
+    """Run the full train/validate/early-stop loop for one curriculum stage.
 
-    Supports gradient accumulation, AMP, cosine LR scheduling, and periodic
-    validation with best-checkpoint saving. When a validation loader is
-    provided, the best checkpoint (lowest validation loss) is saved atomically
-    to *best_ckpt_path* and restored at the end of training. When no
-    validation data is available the final weights are saved instead.
-
-    Early stopping halts training when validation loss has not improved by at
-    least 1e-4 for *patience* consecutive evaluations.
+    Combines gradient accumulation (to reach ``config.LOGICAL_BATCH`` from
+    ``config.PHYSICAL_BATCH``-sized micro-batches), mixed precision, cosine
+    LR scheduling, gradient clipping, and validation-based early stopping
+    with best-checkpoint persistence. The checkpoint at *best_ckpt_path* is
+    only overwritten when validation loss improves by more than ``1e-4``.
+    At the end of the stage, if a best checkpoint was saved, it is reloaded
+    into *raw_model* so the caller always ends up with the best-validation
+    weights rather than the final epoch's weights.
 
     Args:
-        model (torch.nn.Module): Compiled model used for forward/backward passes.
-        raw_model (torch.nn.Module): Underlying (non-compiled) model whose
-            ``state_dict`` is saved to disk and whose parameters are passed to
-            the optimiser.
+        raw_model (torch.nn.Module): The uncompiled model (used for
+            checkpoint state_dict save/load).
+        model (torch.nn.Module): The (possibly ``torch.compile``-wrapped)
+            model used for the forward pass.
         train_loader (torch.utils.data.DataLoader): Training data loader.
-        val_loader (torch.utils.data.DataLoader | None): Validation data
-            loader, or ``None`` to skip validation.
-        vocab (dict[str, int]): Token vocabulary (used to look up the PAD
-            token ID).
-        epochs (int): Maximum number of full passes over the training data.
-        total_steps (int): Total optimiser steps (for LR scheduling).
-        max_lr (float): Peak learning rate.
-        warmup (int): Number of linear warmup steps.
-        best_ckpt_path (str): File path where the best model checkpoint is
-            written.
-        eval_interval (int | None): How many optimiser steps between mid-epoch
-            validation runs. Defaults to ``config.EVAL_INTERVAL_STEPS``.
-        patience (int | None): Number of consecutive evaluations without
-            improvement before early stopping is triggered. Defaults to
-            ``config.EARLY_STOP_PATIENCE``.
+        val_loader (torch.utils.data.DataLoader | None): Validation loader,
+            or ``None`` if no validation split is available for this stage.
+        epochs (int): Maximum number of epochs (a ceiling — early stopping
+            may end training sooner).
+        max_lr (float): Peak learning rate for this stage.
+        warmup (int): Warmup steps for this stage.
+        pad_id (int): Token ID to ignore in the loss.
+        best_ckpt_path (str): Path to persist the best-validation checkpoint.
+        patience (int): Number of consecutive non-improving evaluations
+            before early stopping triggers.
     """
-    eval_interval = (
-        config.EVAL_INTERVAL_STEPS if eval_interval is None else eval_interval
-    )
-    patience = config.EARLY_STOP_PATIENCE if patience is None else patience
-
-    pad_id = vocab[config.PAD_TOK]
-    use_amp, amp_dtype, scaler = _make_amp_config()
-    optimizer = torch.optim.AdamW(
-        _make_param_groups(raw_model, config.WEIGHT_DECAY),
-        lr=max_lr,
-        betas=(0.9, 0.95),
-    )
+    has_val = val_loader is not None
+    autocast_dtype, scaler = _make_amp_config()
     all_params = list(raw_model.parameters())
-    has_val = val_loader is not None and len(val_loader) > 0
+    optimizer = torch.optim.AdamW(
+        _make_param_groups(raw_model), lr=max_lr, betas=(0.9, 0.95)
+    )
+
+    total_steps = epochs * math.ceil(len(train_loader) / config.ACCUM_STEPS)
+
     best_val = float("inf")
     no_improve = 0
     opt_step = 0
     lr = 0.0
     stop = False
+    last_eval_step = -1
 
     def check_val(tag):
         """Evaluate on the validation set, save the checkpoint if improved, and check early stopping."""
-        nonlocal best_val, no_improve, stop
+        nonlocal best_val, no_improve, stop, last_eval_step
+        last_eval_step = opt_step
         val_loss = evaluate(model, val_loader, pad_id)
         improved = val_loss < best_val - 1e-4
         if improved:
@@ -249,70 +244,67 @@ def train_model(
             stop = True
 
     for epoch in range(1, epochs + 1):
-        if stop:
-            break
-        model.train()
         micro_step = 0
         running, running_n = 0.0, 0
 
         for x, y in train_loader:
-            x, y = x.to(config.DEVICE), y.to(config.DEVICE)
-            micro_step += 1
-
-            with autocast(
-                device_type=config.DEVICE.type, dtype=amp_dtype, enabled=use_amp
-            ):
+            x, y = (
+                x.to(config.DEVICE, non_blocking=True),
+                y.to(config.DEVICE, non_blocking=True),
+            )
+            ctx = (
+                torch.autocast(device_type=config.DEVICE.type, dtype=autocast_dtype)
+                if autocast_dtype is not None
+                else torch.enable_grad()
+            )
+            with ctx:
                 logits = model(x)
-                B, T, V = logits.shape
                 loss = F.cross_entropy(
-                    logits.view(B * T, V), y.view(B * T), ignore_index=pad_id
+                    logits.view(-1, logits.size(-1)), y.view(-1), ignore_index=pad_id
                 )
-
-            scaled = loss / config.ACCUM_STEPS
+            scaled_loss = loss / config.ACCUM_STEPS
             if scaler is not None:
-                scaler.scale(scaled).backward()
+                scaler.scale(scaled_loss).backward()
             else:
-                scaled.backward()
+                scaled_loss.backward()
 
             running += loss.item()
             running_n += 1
+            micro_step += 1
 
-            if micro_step % config.ACCUM_STEPS != 0:
-                continue
-
-            opt_step, lr = _step_optimizer(
-                all_params, optimizer, scaler, opt_step, total_steps, max_lr, warmup
-            )
-
-            if opt_step % config.LOG_INTERVAL == 0:
-                log(
-                    f"[step {opt_step:>6}/{total_steps}]"
-                    f"  loss={running / running_n:.4f}  lr={lr:.2e}"
+            if micro_step % config.ACCUM_STEPS == 0:
+                opt_step, lr = _step_optimizer(
+                    optimizer, scaler, all_params, opt_step, total_steps, warmup, max_lr
                 )
-                running, running_n = 0.0, 0
 
-            if has_val and opt_step % eval_interval == 0:
-                check_val(f"[step {opt_step:>6}/{total_steps}]")
-                if stop:
-                    break
+                if opt_step % config.LOG_INTERVAL == 0:
+                    log(
+                        f"Epoch {epoch}/{epochs}  step {opt_step}/{total_steps}"
+                        f"  lr={lr:.2e}  loss={running / max(1, running_n):.4f}"
+                    )
+                    running, running_n = 0.0, 0
+
+                if has_val and opt_step % config.EVAL_INTERVAL_STEPS == 0:
+                    check_val(f"Epoch {epoch}/{epochs}  step {opt_step}/{total_steps}")
+                    if stop:
+                        break
 
         if stop:
             break
 
         if micro_step % config.ACCUM_STEPS != 0:
             opt_step, lr = _step_optimizer(
-                all_params, optimizer, scaler, opt_step, total_steps, max_lr, warmup
+                optimizer, scaler, all_params, opt_step, total_steps, warmup, max_lr
             )
+            if running_n > 0:
+                log(
+                    f"Epoch {epoch}/{epochs}  step {opt_step}/{total_steps}"
+                    f"  lr={lr:.2e}  loss={running / max(1, running_n):.4f}"
+                )
 
-        if running_n > 0:
-            log(
-                f"[step {opt_step:>6}/{total_steps}]"
-                f"  loss={running / running_n:.4f}  lr={lr:.2e}"
-            )
-
-        if has_val:
+        if has_val and opt_step != last_eval_step:
             check_val(f"Epoch {epoch}/{epochs}")
-        else:
+        elif not has_val:
             log(f"Epoch {epoch}/{epochs} complete")
 
         if stop:
@@ -322,148 +314,153 @@ def train_model(
         raw_model.load_state_dict(
             torch.load(best_ckpt_path, map_location=config.DEVICE, weights_only=True)
         )
-        log(f"Restored best checkpoint (val_loss={best_val:.4f}) from {best_ckpt_path}")
-    elif not has_val:
-        tmp = best_ckpt_path + ".tmp"
-        torch.save(raw_model.state_dict(), tmp)
-        os.replace(tmp, best_ckpt_path)
-        log(f"No validation set — saved final weights to {best_ckpt_path}")
+        log(f"Restored best checkpoint (val_loss={best_val:.4f})")
 
 
-def _log_stage(tag, train_loader, val_loader, total_steps, warmup):
-    """Log a summary line with dataset sizes and training hyperparameters for a stage.
+def _log_stage(name, epochs, lr, train_games, val_games):
+    """Log a stage-start banner with its key hyperparameters.
 
     Args:
-        tag (str): Stage label used as a prefix in the log output.
-        train_loader (torch.utils.data.DataLoader): Training data loader.
-        val_loader (torch.utils.data.DataLoader | None): Validation data
-            loader, or ``None`` if no validation data is available.
-        total_steps (int): Total optimiser steps planned for the stage.
-        warmup (int): Number of warmup steps for the stage.
+        name (str): Stage name (e.g. ``"Stage 1 (pretraining)"``).
+        epochs (int): Maximum epochs configured for this stage.
+        lr (float): Peak learning rate for this stage.
+        train_games (int): Number of training sequences/windows.
+        val_games (int): Number of validation sequences/windows.
     """
-    val_chunks = len(val_loader.dataset) if val_loader is not None else 0
+    log(f"── {name} ──")
     log(
-        f"[{tag}]"
-        f"  train_chunks={len(train_loader.dataset):,}"
-        f"  val_chunks={val_chunks:,}"
-        f"  batches/epoch={len(train_loader):,}"
-        f"  steps={total_steps:,}"
-        f"  warmup={warmup}"
-        f"  batch={config.LOGICAL_BATCH}"
-        f"  accum={config.ACCUM_STEPS}x"
+        f"  epochs(max)={epochs}  lr={lr:.1e}  train_windows={train_games:,}  val_windows={val_games:,}"
     )
 
 
 def _run_stage(
-    tag, model, raw_model, train_data, val_data, vocab, epochs, lr, warmup, ckpt_path
+    raw_model,
+    vocab,
+    train_data,
+    val_data,
+    epochs,
+    lr,
+    warmup,
+    ckpt_path,
+    stage_name,
+    patience,
 ):
-    """Run a single training stage, or skip it if its checkpoint already exists.
+    """Train one curriculum stage, or skip it if its checkpoint already exists.
 
-    If *ckpt_path* is present on disk the stage is considered complete: the
-    saved weights are loaded into *raw_model* and the function returns
-    immediately without re-training. This allows an interrupted multi-stage
-    run to resume from the last completed stage.
+    Supports inter-stage resumption: if *ckpt_path* already exists on disk,
+    the stage is assumed complete and its weights are loaded directly
+    instead of retraining. This does not support resuming mid-stage — an
+    interruption partway through a stage requires that stage to restart
+    from scratch, but a fully completed stage is never repeated.
 
     Args:
-        tag (str): Human-readable stage name used in log output.
-        model (torch.nn.Module): Compiled model for forward/backward passes.
-        raw_model (torch.nn.Module): Underlying (non-compiled) model.
-        train_data (torch.Tensor): 1-D token-ID tensor for training.
-        val_data (torch.Tensor): 1-D token-ID tensor for validation.
-        vocab (dict[str, int]): Token vocabulary.
-        epochs (int): Maximum number of epochs for this stage.
+        raw_model (torch.nn.Module): Model to train in place (or load
+            weights into, if the stage is being skipped).
+        vocab (dict[str, int]): Token-to-index mapping (used for pad/bos IDs).
+        train_data (torch.Tensor): Training token stream for this stage.
+        val_data (torch.Tensor): Validation token stream for this stage.
+        epochs (int): Maximum epochs (ceiling) for this stage.
         lr (float): Peak learning rate for this stage.
-        warmup (int): Number of warmup steps for this stage.
-        ckpt_path (str): Path where the best checkpoint for this stage is
-            saved (and checked for an existing run).
+        warmup (int): Warmup steps for this stage.
+        ckpt_path (str): Path to this stage's best-checkpoint file, used
+            both as the resume marker and the save target.
+        stage_name (str): Human-readable stage name for logging.
+        patience (int): Early-stopping patience for this stage.
     """
     if os.path.exists(ckpt_path):
-        log(f"[{tag}] checkpoint found — skipping ...")
+        log(
+            f"{stage_name}: checkpoint already exists at {ckpt_path} — skipping training"
+        )
         raw_model.load_state_dict(
             torch.load(ckpt_path, map_location=config.DEVICE, weights_only=True)
         )
         return
 
-    train_loader = make_loader(train_data, config.PHYSICAL_BATCH, train=True)
-    val_loader = make_loader(val_data, config.PHYSICAL_BATCH, train=False)
-    total_steps = epochs * math.ceil(len(train_loader) / config.ACCUM_STEPS)
-    if total_steps < warmup:
-        log(f"WARNING: [{tag}] total_steps ({total_steps}) < warmup ({warmup})")
-    _log_stage(tag, train_loader, val_loader, total_steps, warmup)
+    pad_id = vocab[config.PAD_TOK]
+    bos_id = vocab[config.BOS_TOK]
+    train_loader = make_loader(train_data, config.PHYSICAL_BATCH, True, bos_id, pad_id)
+    val_loader = make_loader(val_data, config.PHYSICAL_BATCH, False, bos_id, pad_id)
+
+    if train_loader is None:
+        log(f"{stage_name}: no training data available — skipping")
+        return
+
+    _log_stage(
+        stage_name,
+        epochs,
+        lr,
+        len(train_loader.dataset),
+        len(val_loader.dataset) if val_loader is not None else 0,
+    )
+
+    model = torch.compile(raw_model)
+    model.train()
     train_model(
-        model,
         raw_model,
+        model,
         train_loader,
         val_loader,
-        vocab,
         epochs,
-        total_steps,
         lr,
         warmup,
+        pad_id,
         ckpt_path,
+        patience,
     )
-    log(f"[{tag}] best checkpoint: {ckpt_path}")
 
 
 def run_train():
-    """Execute the full two-stage training pipeline from scratch.
+    """Load or build the training data and run the full two-stage curriculum.
 
     Single-responsibility entry point for the one-off training flow. Refuses
     to run if a final trained model is already present — training is meant to
-    be a once-and-done operation; remove the artefacts first if a full retrain
-    is really wanted. Intermediate per-stage checkpoints are still reused to
-    allow resuming an interrupted run.
-
-    Stage 1 (pre-training) trains on games in the ELO range
-    ``[S1_MIN_ELO, S2_MIN_ELO)`` with a higher learning rate and more epochs
-    to build general chess knowledge. Stage 2 (fine-tuning) continues on
-    high-ELO games (``>= S2_MIN_ELO``) with a lower learning rate to
-    specialise the model towards stronger play.
-
-    At the end the final state dict is written atomically to
-    ``config.MODEL_PATH``.
+    be a once-and-done operation; remove the artefact first if a full retrain
+    is really wanted. Only ``config.MODEL_PATH`` is checked (not
+    ``config.VOCAB_PATH``), since the vocab file is also written as an
+    intermediate artefact partway through a normal run — guarding on it too
+    would block resuming an interrupted run. Intermediate per-stage
+    checkpoints are still reused to allow resuming an interrupted run.
     """
-    if os.path.exists(config.MODEL_PATH) or os.path.exists(config.VOCAB_PATH):
-        log(f"ERROR: {config.MODEL_PATH} and/or {config.VOCAB_PATH} already exist.")
+    if os.path.exists(config.MODEL_PATH):
+        log(f"ERROR: {config.MODEL_PATH} already exists.")
         log(
-            "Training is a one-off operation. Remove these files first if you really want to retrain."
+            "Training is a one-off operation. Remove this file first if you really want to retrain."
         )
-        sys.exit(1)
+        return
 
     config.set_seed(config.SEED)
     vocab, s1_train, s1_val, s2_train, s2_val = load_or_build_data()
 
     raw_model = new_model(len(vocab))
-    log("Compiling ...")
-    model = torch.compile(raw_model)
+    params = sum(p.numel() for p in raw_model.parameters())
+    log(f"Model: {params:,} parameters, vocab={len(vocab):,}")
 
     _run_stage(
-        "stage 1 / pretraining",
-        model,
         raw_model,
+        vocab,
         s1_train,
         s1_val,
-        vocab,
         config.S1_EPOCHS,
         config.S1_LR,
         config.S1_WARMUP,
         config.S1_MODEL_PATH,
+        "Stage 1 (pretraining)",
+        config.EARLY_STOP_PATIENCE,
     )
     _run_stage(
-        "stage 2 / finetuning",
-        model,
         raw_model,
+        vocab,
         s2_train,
         s2_val,
-        vocab,
         config.S2_EPOCHS,
         config.S2_LR,
         config.S2_WARMUP,
         config.S2_MODEL_PATH,
+        "Stage 2 (fine-tuning)",
+        config.EARLY_STOP_PATIENCE,
     )
 
     tmp = config.MODEL_PATH + ".tmp"
     torch.save(raw_model.state_dict(), tmp)
     os.replace(tmp, config.MODEL_PATH)
-    log(f"Final model saved: {config.MODEL_PATH}")
-    log("Training complete. Run './chesSLM.py' to use the model.")
+    log(f"Training complete — saved {config.MODEL_PATH}")
