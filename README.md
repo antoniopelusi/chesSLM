@@ -1,6 +1,8 @@
 # ChesSLM
 
-**ChesSLM** is a ~100M parameter, decoder-only causal language model built entirely from scratch in PyTorch to play chess. By treating chess matches as a textual language modeling problem, the network learns to process tokenized sequences of Standard Algebraic Notation (SAN) moves and predict the most stylistically and tactically accurate next move.
+Level: Stockfish ~1650 ELO on temperature 0.0
+
+**ChesSLM** is a ~100M parameters, decoder-only causal language model built entirely from scratch in PyTorch to play chess. By treating chess matches as a textual language modeling problem, the network learns to process tokenized sequences of Standard Algebraic Notation (SAN) moves and predict the most stylistically and tactically accurate next move.
 
 The architecture contains no high-level transformer abstractions (e.g., Hugging Face Transformers, PyTorch Lightning); every element—from custom vocabulary tokenization and Rotary Positional Embeddings (RoPE) to the Pre-LN multi-head causal blocks and the two-stage curriculum training loop—is designed and executed natively from the ground up.
 
