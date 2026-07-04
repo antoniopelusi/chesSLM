@@ -1,6 +1,6 @@
 # ChesSLM
 
-Level: Stockfish ~1650 ELO on temperature 0.0
+> Level: Stockfish ~1650 ELO on temperature 0.0
 
 **ChesSLM** is a ~100M parameters, decoder-only causal language model built entirely from scratch in PyTorch to play chess. By treating chess matches as a textual language modeling problem, the network learns to process tokenized sequences of Standard Algebraic Notation (SAN) moves and predict the most stylistically and tactically accurate next move.
 
