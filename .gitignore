@@ -6,5 +6,6 @@ chesslm_vocab.json
 chesslm_model.pt
 *.tmp*
 
+log
 CuteChess
 CuteChess.AppImage

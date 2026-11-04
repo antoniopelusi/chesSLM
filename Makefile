@@ -1,11 +1,14 @@
-.PHONY: setup cutechess format
-.SILENT: setup cutechess format
+.PHONY: setup reset_venv cutechess format
+.SILENT: setup reset_venv cutechess format
 
 VENV = .venv
 PY_DIRS = chesSLM.py chesslm
 PIP = $(VENV)/bin/pip
 
-setup:
+reset_venv:
+	rm -rf $(VENV)
+
+setup: reset_venv
 	python3 -m venv .venv
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
