@@ -1,146 +1,95 @@
 # ♟️ chesSLM
 Chess **S**mall **L**anguage **M**odel
 
-> Level: Stockfish ~1650 ELO on temperature 0.0
+> Level: Stockfish ~XXX ELO at temperature 0.0
 
-**ChesSLM** is a ~100M parameters, decoder-only causal language model built entirely from scratch in PyTorch to play chess. By treating chess matches as a textual language modeling problem, the network learns to process tokenized sequences of Standard Algebraic Notation (SAN) moves and predict the most stylistically and tactically accurate next move.
+A decoder-only causal language model built from scratch in PyTorch to play chess. Games are tokenized as sequences of Standard Algebraic Notation (SAN) moves, one token per move, and the network predicts the next move. At inference a legal-move mask from `python-chess` guarantees rule-compliant play.
 
-The architecture contains no high-level transformer abstractions (e.g., Hugging Face Transformers, PyTorch Lightning); every element—from custom vocabulary tokenization and Rotary Positional Embeddings (RoPE) to the Pre-LN multi-head causal blocks and the two-stage curriculum training loop—is designed and executed natively from the ground up.
+- Model: [antoniopelusi/chesSLM](https://huggingface.co/antoniopelusi/chesSLM)
+- Dataset: [antoniopelusi/chesSLM-dataset](https://huggingface.co/datasets/antoniopelusi/chesSLM-dataset)
 
----
+The dataset, the vocabulary and the model are three separate artifacts. The dataset holds only the cleaned, deduplicated games (SAN move lists with both ratings), so anyone can use it. Training tokenizes the games, builds the vocabulary and saves it as `chesslm_vocab.json`, and writes the model to `chesslm_model.pt`.
 
-## 🚀 Setup and Run
-
-### 1. Environment Initialization
-
-Initialize a clean Python virtual environment and upgrade the dependency package manager using the provided automation target:
+## Setup
 
 ```bash
 make setup
 ```
 
-### 2. Weight and Artifact Acquisition (One-Time Setup)
-
-To operationalize the engine, you must either download the pre-compiled production weights or execute the training pipeline.
-
-* **Option A: Download Pre-trained Weights (Recommended)**
-Pull the production weights and vocabulary configuration directly from the remote Hugging Face repository (`antoniopelusi/chesSLM`):
+Get the weights, or train from scratch:
 
 ```bash
 ./chesSLM.py --getmodel
-```
-
-* **Option B: Train From Scratch**
-Trigger the local two-stage curriculum training pipeline. This will dynamically stream dataset chunks and build artifacts locally:
-
-```bash
 ./chesSLM.py --train
 ```
 
-### 3. Execution & Interface Hooking
+`--getmodel` downloads `chesslm_model.pt` and `chesslm_vocab.json` from the model repository. `--train` trains from scratch with the settings in `config.json`, using the games of the dataset repository (downloaded once). It refuses to run if `chesslm_model.pt` already exists.
 
-ChesSLM implements the Universal Chess Interface (UCI) protocol. At boot, the main entry point runs an automated hardware assessment, dynamically querying `nvidia-smi` to pin execution to the GPU containing the highest available VRAM, and provisions the necessary `LD_LIBRARY_PATH` variables.
+## Play
 
-* **GUI Integration (Graphical Play):**
-You can download CuteChess GUI using the following command:
-```bash
-make cutechess
-```
+chesSLM speaks UCI, so `./chesSLM.py` can be added as an engine to any UCI chess GUI (for example CuteChess, or Arena) to play against it or to run matches against other engines. Install CuteChess with `make cutechess`, then add `./chesSLM.py` as an engine with the repository root as working directory. It has been tested with CuteChess.
 
+The engine answers `uciok` immediately and loads the model afterwards, so `readyok` is sent only when the model is ready. The `Temperature` engine option controls sampling over legal moves. `0.0` is greedy argmax; values between 0.0 and 0.3 are recommended.
 
-Then:
-1. Navigate to **Tools > Settings > Engines > Add**.
-2. Set the executable path pointing to `./chesSLM.py`.
-3. Ensure the working directory is explicitly targeted at the repository root.
-4. **Engine Options:** Set the `Temperature` parameter via the `Advanced` panel of an engine entry. A value between **0.0 and 0.3** is highly recommended for stable positional play. Setting it to `0.0` automatically routes inference to pure deterministic argmax (greedy decoding).
+## Results
 
+| Metric | Value |
+|---|---|
+| Stockfish-equivalent level (temperature 0.0) | ~XXX ELO |
+| Final validation loss | XXX |
+| Training time | XXX hours on XXX |
 
-* **Raw CLI Interactive Session:**
-```bash
-./chesSLM.py
-```
+## Model
 
+| Component | Value |
+|---|---|
+| Parameters | 204,920,448 |
+| Layers | 14 |
+| Hidden size | 1088 |
+| Attention heads | 17 (head size 64) |
+| Feed-forward | GELU, 4 × hidden size |
+| Normalization | Pre-LayerNorm |
+| Positions | Rotary (RoPE), base 10000 |
+| Embeddings | tied input and output |
+| Context length | 704 |
+| Vocabulary | one token per move, plus `<pad>` and `<bos>`, padded to a multiple of 64 |
 
-Here you can manually pipe standard UCI instructions (`isready`, `position startpos moves e2e4`, `go`) into stdin.
+No biases in the linear layers and no dropout. Initialization is GPT-2 style: standard deviation 0.02, residual projections scaled by `1/sqrt(2 * layers)`. The parameter count is `N = V*d + L*(12*d^2 + 4*d) + 2*d` with `V` the vocabulary size rounded up to a multiple of 64. Inference uses a KV cache that reuses the shared prefix between consecutive positions, so each move only processes the new tokens.
 
----
+## Data
 
-## 🛠️ Core Technologies & Architectural Stack
+The dataset is built from several public game collections, with check and mate marks (`+`, `#`) removed from the moves and exact duplicate games removed (first occurrence kept), which leaves 14,100,262 games and 5,498 distinct moves. Nothing else is filtered: the source has no game under 11 plies and no malformed move (measured). The longest game has 692 plies, below the context length, so no game is ever cut. Source composition, columns and usage are in the dataset card.
 
-ChesSLM operates on a hyperparameter configuration optimized for fixed-pool multi-epoch training: a Context Window of **350 tokens**, an Embedding Dimension (`d_model`) of **896**, **14** Attention Heads, **10** Transformer Layers, and a Feed-Forward dimension (`d_ff`) of **3584**, with a baseline network dropout of **0.10**.
+## Training
 
-The forward pass natively implements the following layer-by-layer architectural flow:
+1. **Tokenization.** At the start of training each distinct move gets an id, in order of first appearance after `<pad>` (0) and `<bos>` (1), and each game becomes `<bos> m1 ... mn`. Everything is deterministic: the same dataset always gives the same vocabulary.
+2. **Routing.** Games where both ratings are known and at least `stage2_min_elo` go to stage 2; all others go to stage 1. A random `val_fraction` of the games (drawn with the seed `train.seed`, so it is the same in every run) is held out for validation.
+3. **One game per row.** Every training row is a single game starting at `<bos>`, exactly like at inference: no packing across games, no cross-game attention, no masked fragments. Games are grouped by length into buckets of 16 tokens and batched with right padding (ignored by the loss) so that padding stays under 10%. Micro-batches are reshuffled every epoch and the loss is the exact mean over all real target tokens of the optimizer step.
+4. **Stage 1 then stage 2.** Each stage runs a fixed number of epochs with linear warmup (`warmup_ratio` of the stage's total steps) and a full cosine decay to `0.1 * lr`. There is no early stopping: the final weights are the last step of stage 2. AdamW with decoupled weight decay on matrices only, betas (0.9, 0.95), gradient clipping 1.0, gradient accumulation over `batch_tokens / micro_tokens` micro-batches. Forward passes use bfloat16 autocast with fp32 master weights, and the model is compiled with `torch.compile`.
+5. **Monitoring.** Four times per epoch the log reports `eval_train_loss` (a fixed random subset of the training games, the same size as the validation set) and `eval_val_loss` (the held-out games), measured on the same weights. A validation loss that stops falling or rises while the training loss keeps falling marks the onset of overfitting. Every 100 steps it also reports the running `train_loss` and the gradient norm before clipping. Both are monitors only and never used for early stopping.
 
-1. **Token Embedding & Regularization:** The input sequence of SAN token IDs is mapped to the 896-dimensional hidden space via a standard `nn.Embedding` matrix. Absolute positional embeddings are entirely omitted. The raw embeddings immediately pass through an `nn.Dropout` layer to prevent early sequence memorization.
-2. **Pre-LN Transformer Blocks (x10):** The sequence cascades through a stack of 10 identical decoder-only blocks. Each block strictly adheres to a Pre-Layer Normalization (`nn.LayerNorm`) topology, applying normalization before the attention and feed-forward sub-layers to stabilize gradient flow across the residual stream.
-3. **Causal Self-Attention with RoPE:** Inside the attention sub-layer, a single bias-free fused linear projection (`nn.Linear(d_model, 3 * d_model)`) splits the hidden states into Query, Key, and Value tensors. Rather than using absolute positions, **Rotary Positional Embeddings (RoPE)** are applied dynamically: precomputed sine and cosine matrices geometrically rotate the Query and Key vectors in 2-D subspaces. This encodes relative positioning directly into the dot-product, offering superior inductive bias for sequential move logic. The tensors are then passed to `torch.nn.functional.scaled_dot_product_attention` (`is_causal=True`) to leverage hardware-accelerated FlashAttention kernels.
-4. **Feed-Forward Network (MLP):** The context-aware vectors exit the attention block, undergo a second Pre-LN, and enter the FFN to process rigid chess logic. The FFN expands the dimension by a factor of 4x (to 3584) via a linear layer, applies a non-linear `nn.GELU` activation, drops out 10% of the weights, and compresses the space back to 896 via a final linear projection.
-5. **Residual Scale Initialization:** Mimicking GPT-2 practices, linear layers that write directly onto the residual stream (the attention and FFN output projections) have their standard deviation scaled down by `1 / sqrt(2 * n_layers)` during initialization (`RESIDUAL_SCALE_INIT = True`), compensating for variance accumulation across depth.
-6. **Final Normalization & Unembedding (Weight Tying):** The tensor exiting the final transformer block undergoes a concluding `nn.LayerNorm`. It is then projected into the vocabulary distribution via a bias-free linear head. To drastically compress the model footprint and enforce symmetric semantic clustering, this output head utilizes **Weight Tying** (`self.head.weight = self.tok_emb.weight`), sharing its parameter matrix identically with the input token embedding layer.
-7. **Neuro-Symbolic Move Masking:** During inference, the neural network generates logits for the entire vocabulary, but a programmatic programmatic legal-move mask (via `python-chess`) filters the distribution prior to temperature scaling and sampling. This hybrid approach guarantees 100% rule-compliant engine behavior.
+## Configuration
 
----
+Every setting worth changing lives in `config.json`:
 
-## 🧠 Deep Dive: End-to-End Training Flow
+| Section | Keys |
+|---|---|
+| `model` | `d_model`, `n_layers`, `context_len` |
+| `data` | `stage2_min_elo`, `val_fraction` |
+| `train` | `seed`, `batch_tokens`, `micro_tokens`, `weight_decay` |
+| `stage1`, `stage2` | `epochs`, `lr`, `warmup_ratio` |
+| `inference` | `temperature` |
 
-The complete training architecture, implemented in `train.py`, operates as an automated multi-stage pipeline designed to scale modern text generation concepts into structural board game logic.
+Fixed in code: head dimension 64 (so `n_heads = d_model / 64`), feed-forward width `4 * d_model`, RoPE base 10000, AdamW betas (0.9, 0.95), gradient clipping 1.0, final learning rate `0.1 * lr`. `batch_tokens` is the number of (padded) tokens per optimizer step. `micro_tokens` is the number per forward pass and only affects memory and speed; it must divide `batch_tokens` and be at least `context_len`, and the number of accumulation steps is `batch_tokens / micro_tokens`.
 
-```text
-[Hugging Face Stream] ──> [Validation & SAN Normalization] ──> [ELO Routing] ──> [Vocabulary Synthesis]
-                                                                        │
-┌───────────────────────────────────────────────────────────────────────┘
-│
-├──> [STAGE 1: Pre-training] ──> best known ELO < 2400, or unrated ──> Learns Rules, Openings & Tactics
-│                                                                 │
-└──> [STAGE 2: Fine-tuning]  ──> best known ELO >= 2400          ──> Learns Positional Grandmaster Strategy
-```
+## Layout
 
-### Step 1: Ingestion, Filtration & Vocabulary Synthesis
-
-1. **Streaming Data Ingestion:** The dataset (`angeluriot/chess_games`) is streamed iteratively to eliminate memory-bound bottlenecks.
-2. **Filtration Pass:** Games shorter than 10 half-moves are discarded. Every remaining move is replayed against a legality checker; any game where a move fails to parse or isn't legal in sequence is dropped as malformed.
-3. **ELO Routing:** The higher of the two known player ratings (if any) dictates the routing. Games with a known rating >= 2400 go to the fine-tuning pool; everything else goes to the pre-training pool.
-4. **Tokenization Strategy:** A vocabulary mapping dictionary is mined from the SAN move strings (with check/mate modifiers stripped), plus three special tokens:
-* `<pad>`: Fills unused positions at inference, and masks target positions in the loss function.
-* `<bos>`: Prepended to mark the start of each game.
-* `<eos>`: Appended to mark the end of each game.
-
-
-5. **Orphan Fragment Masking:** Games are concatenated into a flat 1-D stream and sliced into fixed 350-token context windows. If a window begins mid-game, the preceding moves are absent, making the board state un-reconstructable. The `ChessDataset` automatically identifies these "orphan fragments" and sets target tokens prior to the first `<bos>` to the `<pad>` ID, ensuring they are ignored during loss computation.
-
-### Step 2: Two-Stage Curriculum Strategy
-
-Instead of optimizing indiscriminately over the entire dataset, the network undergoes a strict chronological ELO-based curriculum:
-
-* **Stage 1 (Pre-training — up to 5 Epochs):** Trained on every game not routed to Stage 2. This phase optimizes high-entropy distributions, instructing the network on foundational game structure, common opening books, and basic tactical calculations. Peak learning rate: `4e-4`.
-* **Stage 2 (Fine-tuning — up to 6 Epochs):** Restricted to games where at least one player has a known rating >= 2400. The learning rate is throttled down (5x lower peak, `8e-5`) to subtly shift the attention weights toward high-level positional configurations, end-game execution, and nuanced strategic play without suffering catastrophic forgetting.
-
-*Note: Epoch counts are ceilings; a validation-based early stopping mechanism typically halts stages before completion.*
-
-### Step 3: The Forward-Backward Optimization Mechanics
-
-During active training execution, each step undergoes the following performance and mathematical routines:
-
-* **Batching & Gradient Accumulation:** To simulate a highly stable macro batch size of `1024` sequences on restricted hardware configurations, gradients are mathematically accumulated across consecutive physical sub-batches of `256` items over `4` accumulation steps before triggering an optimizer step.
-* **Automatic Mixed Precision (AMP):** Execution frames are dynamically cast using PyTorch's native `autocast`. The system checks hardware compatibility at boot, prioritizing `bfloat16` (scaler-free) for numerical stability, or falling back onto `float16` scaled via an automated `GradScaler` to prevent gradient underflow.
-* **Split Weight Decay Optimization (`AdamW`):** The network parameters are split into two decoupled optimizer groups:
-1. All 2D+ weight matrices — including the tied token embedding/output matrix — are penalized with a weight decay coefficient of `0.10`.
-2. All 1D tensors (biases and LayerNorm scales) are fully exempt from weight decay.
-
-
-* **Learning Rate Scheduling:** The effective learning rate follows a strict Cosine Decay schedule. It utilizes a linear warmup over `200` initialization steps up to the peak stage-specific learning rate, subsequently executing a cosine curve degradation down to a hard floor value of `1e-5`.
-* **Gradient Clipping:** Prior to executing optimizer updates, the L2 norm of the accumulated gradients is checked and capped at a hard threshold of `1.0` to eliminate exploding gradient steps through dense attention blocks.
-
----
-
-## 📁 Repository Blueprint
-
-* `chesSLM.py`: System operational gateway. Validates local environment parameters, triggers GPU load-balancing heuristics, interprets CLI directives, and launches runtime instances.
-* `config.py`: Hardcoded model dimension parameters, sequence length constraints, training hyper-parameters, and mutable inference options.
-* `model.py`: Natively engineered Transformer architecture blocks, RoPE injections, Pre-LN pipelines, multi-head causal attention mechanisms, and custom weight initializers.
-* `data.py` / `vocab.py`: Data pipeline logic, HF dataset download routines, context-window slicing (with orphan fragment masking), split generation, and vocabulary lookup tables.
-* `train.py`: Rigid optimization loops, validation checkpoint management, AMP context setups, cosine LR scheduling, and curriculum execution logic.
-* `inference.py`: Real-time autoregressive text generation, temperature sampling calculations, KV caching simulation, and full UCI protocol command parsing loops.
-* `run.py`: Primary execution script. Serves as the main entry point for triggering specific sub-modules, launching the application, or managing the engine's lifecycle.
-* `util.py`: Subprocess interfaces mapping system hardware capabilities (`nvidia-smi` parser).
-* `paths.py`: Isolated, dependency-free global file system paths and remote HF repository registry IDs utilized by the lightweight downloader.
+- `chesSLM.py`: entry point (`--train`, `--getmodel`, UCI by default).
+- `config.json`: all tunable settings.
+- `chesslm/config.py`: loads `config.json`; constants, file names, device.
+- `chesslm/model.py`: architecture and checkpoint save/load.
+- `chesslm/data.py`: dataset loading, tokenization and length-bucketed batching.
+- `chesslm/train.py`: two-stage training loop.
+- `chesslm/getmodel.py`: pretrained model download.
+- `chesslm/inference.py`: KV-cached engine, UCI loop, startup.
+- `chesslm/util.py`: logging, CUDA environment and GPU selection.

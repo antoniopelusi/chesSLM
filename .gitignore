@@ -1,15 +1,10 @@
 .venv
-
 __pycache__
-
-chesslm_data_s1_train
-chesslm_data_s2_train
-
-chesslm_data_s1_val
-chesslm_data_s2_val
+.DS_Store
 
 chesslm_vocab.json
-
 chesslm_model.pt
+*.tmp*
 
+CuteChess
 CuteChess.AppImage
