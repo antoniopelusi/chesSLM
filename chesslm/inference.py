@@ -6,7 +6,7 @@ import chess
 import torch
 import torch.nn.functional as F
 
-from .config import BOS, DEVICE, MODEL_PATH, PAD, VOCAB_PATH, cfg, set_seed
+from .config import BOS, DEVICE, PAD, cfg, set_seed
 from .model import load_checkpoint
 from .util import log
 
@@ -94,18 +94,18 @@ def set_option(parts):
         log(f"ERROR: invalid temperature {value!r}")
 
 
-def load_engine():
-    with open(VOCAB_PATH) as f:
+def load_engine(model_path, vocab_path):
+    with open(vocab_path) as f:
         vocab = json.load(f)
-    log(f"Loading {MODEL_PATH} ...")
-    model = load_checkpoint(MODEL_PATH)
+    log(f"Loading {model_path} ...")
+    model = load_checkpoint(model_path)
     log(f"Vocab: {len(vocab):,} tokens (padded to {model.tok_emb.num_embeddings:,})")
     log(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
     log("Ready")
     return Engine(model, vocab)
 
 
-def uci_loop():
+def uci_loop(model_path, vocab_path):
     board = chess.Board()
     game_moves = []
     engine = None
@@ -121,7 +121,7 @@ def uci_loop():
             default = cfg.inference.temperature
             print(f"option name Temperature type string default {default}")
             print("uciok", flush=True)
-            engine = engine or load_engine()
+            engine = engine or load_engine(model_path, vocab_path)
         elif cmd.startswith("setoption"):
             set_option(cmd.split())
         elif cmd == "isready":
@@ -138,6 +138,6 @@ def uci_loop():
         sys.stdout.flush()
 
 
-def run_inference():
+def run_inference(model_path, vocab_path):
     set_seed(cfg.train.seed)
-    uci_loop()
+    uci_loop(model_path, vocab_path)

@@ -14,6 +14,7 @@ parser = argparse.ArgumentParser(prog="chesSLM")
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--train", action="store_true", help="Train the model from scratch")
 group.add_argument("--getmodel", action="store_true", help="Download the trained model")
+group.add_argument("--model", default=".", metavar="DIR", help="Model directory")
 args = parser.parse_args()
 
 if args.train:
@@ -30,10 +31,12 @@ elif args.getmodel:
 
     run_getmodel()
 else:
-    if not (os.path.exists(MODEL_PATH) and os.path.exists(VOCAB_PATH)):
+    model_path = os.path.join(args.model, MODEL_PATH)
+    vocab_path = os.path.join(args.model, VOCAB_PATH)
+    if not (os.path.exists(model_path) and os.path.exists(vocab_path)):
         parser.error(
-            f"Missing {MODEL_PATH} or {VOCAB_PATH}. Run --getmodel or --train."
+            f"Missing {model_path} or {vocab_path}. Use --getmodel, --train or --model DIR."
         )
     from chesslm.inference import run_inference
 
-    run_inference()
+    run_inference(model_path, vocab_path)
