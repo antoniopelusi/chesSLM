@@ -11,7 +11,7 @@
   "train": {
     "seed": 42,
     "batch_tokens": 180000,
-    "micro_tokens": 60000,
+    "micro_tokens": 180000,
     "weight_decay": 0.1
   },
   "stage1": {
