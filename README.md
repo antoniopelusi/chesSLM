@@ -1,7 +1,7 @@
 # ♟️ chesSLM
 Chess **S**mall **L**anguage **M**odel
 
-> Level: Stockfish ~XXX ELO at temperature 0.0
+> Level: Stockfish ~1650 ELO at temperature 0.0
 
 A decoder-only causal language model built from scratch in PyTorch to play chess. Games are tokenized as sequences of Standard Algebraic Notation (SAN) moves, one token per move, and the network predicts the next move. At inference a legal-move mask from `python-chess` guarantees rule-compliant play.
 
@@ -25,7 +25,7 @@ Get the weights, or train from scratch:
 ./chesSLM.py --train
 ```
 
-`--getmodel` downloads `chesslm_model.pt` and `chesslm_vocab.json` from the model repository. `--train` trains from scratch with the settings in `config.json`, using the games of the dataset repository (downloaded once). It needs a CUDA GPU (about 42 GB of peak memory with the default settings) and refuses to run if `chesslm_model.pt` already exists.
+`--getmodel` downloads `chesslm_model.pt` and `chesslm_vocab.json` from the model repository. `--train` trains from scratch with the settings in `config.json`, using the games of the dataset repository (downloaded once). It needs a CUDA GPU (about 73 GB of peak memory with the default settings) and refuses to run if `chesslm_model.pt` already exists.
 
 ## Play
 
@@ -62,10 +62,10 @@ A GPT-style decoder, with the choices that are standard for this size:
 
 | Component | Value |
 |---|---|
-| Parameters | 204,920,448 |
-| Layers | 14 |
-| Hidden size | 1088 |
-| Attention heads | 17 (head size 64) |
+| Parameters | 101,307,136 |
+| Layers | 10 |
+| Hidden size | 896 |
+| Attention heads | 14 (head size 64) |
 | Feed-forward | GELU, 4 × hidden size |
 | Normalization | Pre-LayerNorm |
 | Positions | Rotary (RoPE), base 10000 |
@@ -79,22 +79,22 @@ Each block is `x + Attention(LN(x))` followed by `x + FFN(LN(x))`, where the fee
 ### Training
 
 - **Two stages, one model.** The same weights are trained first on stage 1 (all games below the Elo threshold), then on stage 2 (games between players rated 2500 or more). Stage 1 learns the rules and general play; stage 2 moves the model towards the moves of strong players. Each stage builds a fresh AdamW optimizer and its own schedule, and its step counter restarts from zero.
-- **Optimizer.** AdamW with betas (0.9, 0.95), weight decay 0.1 on matrices only (the embedding included, the LayerNorm parameters excluded), gradient clipping at 1.0. Learning rate 3e-4 in stage 1 and 6e-5 in stage 2, 4 epochs each.
-- **Schedule.** The learning rate is set at every step: linear warmup over `warmup_ratio` of the stage's steps (3% and 2%), then a cosine decay to 0.1 × the peak. There are 4,572 steps per epoch in stage 1 (18,288 in total) and 2,584 in stage 2 (10,336); the few micro-batches left over at the end of an epoch are dropped.
-- **One optimizer step.** `batch_tokens` / `micro_tokens` = 3 micro-batches of up to 60,000 padded tokens are accumulated. The loss is the sum of the cross-entropy (computed on float32 logits) over all real target tokens, divided by the number of real target tokens of the whole step, so every token weighs the same whatever the length of its game.
+- **Optimizer.** AdamW with betas (0.9, 0.95), weight decay 0.1 on matrices only (the embedding included, the LayerNorm parameters excluded), gradient clipping at 1.0. Learning rate 4e-4 in stage 1 and 6e-5 in stage 2, 4 epochs each.
+- **Schedule.** The learning rate is set at every step: linear warmup over `warmup_ratio` of the stage's steps (3% and 2%), then a cosine decay to 0.1 × the peak. There are 4,587 steps per epoch in stage 1 (18,348 in total) and 2,598 in stage 2 (10,392); the few micro-batches left over at the end of an epoch are dropped.
+- **One optimizer step.** `batch_tokens` / `micro_tokens` = 1 micro-batch of up to 180,000 padded tokens per step (no gradient accumulation with the default settings). The loss is the sum of the cross-entropy (computed on float32 logits) over all real target tokens, divided by the number of real target tokens of the whole step, so every token weighs the same whatever the length of its game.
 - **Precision and speed.** bfloat16 autocast with fp32 master weights, and the model is compiled with `torch.compile`.
-- **Monitoring.** Every line of the log starts with the time. Training lines look like `stage1 ep 1/4 step 100/18288 lr 5.46e-05 mem 41.5 GB train_loss 6.2004 grad 4.64`: `mem` is the peak GPU memory, `train_loss` and `grad` are the averages of the loss and of the gradient norm before clipping since the previous report (at most 100 steps; the window restarts at the beginning of each epoch). Four times per epoch (the last one at the end of the epoch) a line reports `eval_train_loss` (a fixed random subset of the training games, the same size as the validation set) and `eval_val_loss` (the held-out games), computed without gradients on the same weights. A validation loss that stops falling or rises while the training loss keeps falling marks the onset of overfitting.
+- **Monitoring.** Every line of the log starts with the time. Training lines look like `stage1 ep 1/4 step 100/18348 lr 7.27e-05 mem 73.3 GB train_loss 6.3773 grad 3.52`: `mem` is the peak GPU memory, `train_loss` and `grad` are the averages of the loss and of the gradient norm before clipping since the previous report (at most 100 steps; the window restarts at the beginning of each epoch). Four times per epoch (the last one at the end of the epoch) a line reports `eval_train_loss` (a fixed random subset of the training games, the same size as the validation set) and `eval_val_loss` (the held-out games), computed without gradients on the same weights. A validation loss that stops falling or rises while the training loss keeps falling marks the onset of overfitting. The complete log of the training run of the published model is available in this repository as `training.log`.
 - **No early stopping.** The final weights are those of the last step of stage 2.
 
 ### Results
 
 | Metric | Value |
 |---|---|
-| Stockfish-equivalent level (temperature 0.0) | ~XXX ELO |
-| Validation loss, end of stage 1 (games below 2500) | 1.385 |
-| Validation loss, end of stage 2 (games rated 2500+) | 1.289 |
+| Stockfish-equivalent level (temperature 0.0) | ~1650 ELO |
+| Validation loss, end of stage 1 (games below 2500) | 1.423 |
+| Validation loss, end of stage 2 (games rated 2500+) | 1.331 |
 
-The final loss corresponds to a perplexity of about 3.6 equally likely moves per position. The validation loss decreased throughout both stages (a single rise of 0.0004 in stage 2, within noise), and at the end the gap between validation and training loss (measured on the subset) is 0.09 in stage 1 and 0.07 in stage 2: the model generalizes and the last weights are also the best. The validation loss measures how well the model predicts held-out games, not how well it plays, which is why the level is measured by playing against Stockfish.
+The final loss corresponds to a perplexity of about 3.8 equally likely moves per position. The validation loss decreased throughout both stages, and at the end the gap between validation and training loss (measured on the subset) is 0.06 in stage 1 and 0.04 in stage 2: the model generalizes and the last weights are also the best. The validation loss measures how well the model predicts held-out games, not how well it plays, which is why the level is measured by playing against Stockfish.
 
 ### The three flows
 
@@ -143,6 +143,7 @@ Checked when the program starts (the last one when training loads the data): `d_
 
 - `chesSLM.py`: entry point (`--train`, `--getmodel`, `--model DIR`, UCI by default).
 - `config.json`: all tunable settings.
+- `training.log`: complete log of the training run of the published model.
 - `chesslm/config.py`: loads `config.json`; constants, file names, device.
 - `chesslm/model.py`: architecture and checkpoint save/load.
 - `chesslm/data.py`: dataset loading, tokenization and length-bucketed batching.
