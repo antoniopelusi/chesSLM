@@ -9,7 +9,7 @@ DATASET_ID = "antoniopelusi/chesSLM-dataset"
 MODEL_ID = "antoniopelusi/chesSLM"
 
 VOCAB_PATH = "chesslm_vocab.json"
-MODEL_PATH = "chesslm_model.pt"
+MODEL_PATH = "chesslm_model.safetensors"
 
 PAD, BOS = 0, 1
 SPECIAL_TOKENS = {"<pad>": PAD, "<bos>": BOS}

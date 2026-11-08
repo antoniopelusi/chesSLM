@@ -8,7 +8,7 @@ A decoder-only causal language model built from scratch in PyTorch to play chess
 - Model: [antoniopelusi/chesSLM](https://huggingface.co/antoniopelusi/chesSLM)
 - Dataset: [antoniopelusi/chesSLM-dataset](https://huggingface.co/datasets/antoniopelusi/chesSLM-dataset)
 
-The dataset, the vocabulary and the model are three separate artifacts. The dataset holds only the cleaned, deduplicated games (SAN move lists with both ratings), so anyone can use it. Training tokenizes the games, builds the vocabulary and saves it as `chesslm_vocab.json`, and writes the model to `chesslm_model.pt`.
+The dataset, the vocabulary and the model are three separate artifacts. The dataset holds only the cleaned, deduplicated games (SAN move lists with both ratings), so anyone can use it. Training tokenizes the games, builds the vocabulary and saves it as `chesslm_vocab.json`, and writes the model to `chesslm_model.safetensors`.
 
 ## Setup
 
@@ -25,13 +25,13 @@ Get the weights, or train from scratch:
 ./chesSLM.py --train
 ```
 
-`--getmodel` downloads `chesslm_model.pt` and `chesslm_vocab.json` from the model repository. `--train` trains from scratch with the settings in `config.json`, using the games of the dataset repository (downloaded once). It needs a CUDA GPU (about 73 GB of peak memory with the default settings) and refuses to run if `chesslm_model.pt` already exists.
+`--getmodel` downloads `chesslm_model.safetensors` and `chesslm_vocab.json` from the model repository. `--train` trains from scratch with the settings in `config.json`, using the games of the dataset repository (downloaded once). It needs a CUDA GPU (about 73 GB of peak memory with the default settings) and refuses to run if `chesslm_model.safetensors` already exists.
 
 ## Play
 
 chesSLM speaks UCI, so `./chesSLM.py` can be added as an engine to any UCI chess GUI (for example CuteChess, or Arena) to play against it or to run matches against other engines. Install CuteChess with `make cutechess`, then add `./chesSLM.py` as an engine with the repository root as working directory. It has been tested with CuteChess.
 
-Playing needs only `./chesSLM.py`, with no argument: it looks for `chesslm_model.pt` and `chesslm_vocab.json` in the current working directory (the repository root). To play with a model stored elsewhere, pass the directory (not a file) that contains it, with the same two file names `chesslm_model.pt` and `chesslm_vocab.json`: `./chesSLM.py --model /path/to/directory` (in a GUI, put `--model /path/to/directory` in the engine arguments). The model must have been produced by this code.
+Playing needs only `./chesSLM.py`, with no argument: it looks for `chesslm_model.safetensors` and `chesslm_vocab.json` in the current working directory (the repository root). To play with a model stored elsewhere, pass the directory (not a file) that contains it, with the same two file names `chesslm_model.safetensors` and `chesslm_vocab.json`: `./chesSLM.py --model /path/to/directory` (in a GUI, put `--model /path/to/directory` in the engine arguments). The model must have been produced by this code.
 
 The engine answers `uciok` immediately and loads the model afterwards, so `readyok` is sent only when the model is ready. The `Temperature` engine option controls sampling over legal moves. `0.0` is greedy argmax; values between 0.0 and 0.3 are recommended. It runs on the GPU if one is available, otherwise on the CPU.
 
@@ -102,22 +102,22 @@ The final loss corresponds to a perplexity of about 3.8 equally likely moves per
 
 **`--train`**
 
-1. Checks that `chesslm_model.pt` does not exist in the current directory and that CUDA is available.
+1. Checks that `chesslm_model.safetensors` does not exist in the current directory and that CUDA is available.
 2. Fixes the random seeds.
 3. Downloads `train.parquet` from the dataset repository and reads it row group by row group: builds the vocabulary, inserts `<bos>`, computes the Elo of each game, checks that the longest game fits in the context length, and creates the four pools (stage 1, stage 2 and their validation sets).
 4. Pads the vocabulary size to a multiple of 64, builds the model, prints the vocabulary size and the parameter count, and compiles it.
 5. Runs stage 1, then stage 2 (the same function with different data and settings). It prints the size of the stage and its schedule, picks the training subset used for evaluation, and then for every step sets the learning rate, accumulates the gradients of the micro-batches, clips, updates and logs; four times per epoch it evaluates the training subset and the validation set.
-6. Writes the weights and the architecture to `chesslm_model.pt` and the vocabulary to `chesslm_vocab.json`, in the current directory.
+6. Writes the weights to `chesslm_model.safetensors`, with the architecture (`d_model`, `n_layers`, `context_len`) in the metadata of the file, and the vocabulary to `chesslm_vocab.json`, in the current directory.
 
 **`--getmodel`**
 
-1. For each of `chesslm_model.pt` and `chesslm_vocab.json`: if the file already exists it is skipped.
-2. Otherwise it is downloaded from the model repository and copied into the current directory.
+1. For each of `chesslm_model.safetensors` and `chesslm_vocab.json`: if the file already exists it is skipped.
+2. Otherwise it is downloaded from the model repository and copied into the current directory. For the model file it then checks that the architecture is in the metadata.
 
 **Play (no argument)**
 
 1. Checks that the model and the vocabulary exist (in the current directory, or in the directory given with `--model`), otherwise stops suggesting `--getmodel`, `--train` or `--model DIR`. Then it fixes the seed and starts reading UCI commands from standard input.
-2. On `uci` it answers with the engine name and author and the `Temperature` option, sends `uciok`, then loads the vocabulary and the model. The architecture is read from the checkpoint. Later commands wait until loading is done, so `readyok` is sent when the engine is ready.
+2. On `uci` it answers with the engine name and author and the `Temperature` option, sends `uciok`, then loads the vocabulary and the model. The architecture is read from the metadata of the safetensors file. Later commands wait until loading is done, so `readyok` is sent when the engine is ready.
 3. On `position` it rebuilds the board (from `startpos` or a FEN, plus the moves played) and converts the moves to SAN without check and mate marks. Games that start from a FEN other than the initial position are outside what the model was trained on.
 4. On `go` it builds the sequence `<bos>` followed by the game and finds how much of it is the same as the previous position, so that only the new tokens (always at least the last one) go through the model, with the cached keys and values of the shared prefix. Moves not in the vocabulary map to `<pad>`, and the sequence is cut to the last 704 tokens if it is longer.
 5. It takes the logits of the last position, keeps only the legal moves that exist in the vocabulary, and answers with the best one (argmax when the temperature is 0, otherwise a sample from the softmax of the scores divided by the temperature). If no legal move is in the vocabulary it plays a random legal move.
@@ -145,7 +145,7 @@ Checked when the program starts (the last one when training loads the data): `d_
 - `config.json`: all tunable settings.
 - `training.log`: complete log of the training run of the published model.
 - `chesslm/config.py`: loads `config.json`; constants, file names, device.
-- `chesslm/model.py`: architecture and checkpoint save/load.
+- `chesslm/model.py`: architecture and safetensors save/load.
 - `chesslm/data.py`: dataset loading, tokenization and length-bucketed batching.
 - `chesslm/train.py`: two-stage training loop.
 - `chesslm/getmodel.py`: pretrained model download.

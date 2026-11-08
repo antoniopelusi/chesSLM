@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 
 from .config import DEVICE, HEAD_DIM
 
@@ -121,13 +123,28 @@ class ChesSLM(nn.Module):
         return F.linear(self.ln_f(h), self.tok_emb.weight), new_past
 
 
+ARCH_KEYS = ("d_model", "n_layers", "context_len")
+
+
 def save_checkpoint(model, path):
-    torch.save({"arch": model.arch, "state": model.state_dict()}, path)
+    state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+    metadata = {"format": "pt", **{k: str(model.arch[k]) for k in ARCH_KEYS}}
+    save_file(state, path, metadata=metadata)
+
+
+def read_arch(path):
+    with safe_open(path, framework="pt") as f:
+        metadata = f.metadata() or {}
+    missing = [k for k in ARCH_KEYS if k not in metadata]
+    if missing:
+        raise ValueError(f"{path}: no {', '.join(missing)} in the file metadata")
+    return {k: int(metadata[k]) for k in ARCH_KEYS}
 
 
 def load_checkpoint(path):
-    checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
-    vocab_size = checkpoint["state"]["tok_emb.weight"].size(0)
-    model = ChesSLM(vocab_size, **checkpoint["arch"]).to(DEVICE)
-    model.load_state_dict(checkpoint["state"])
+    arch = read_arch(path)
+    state = load_file(path, device=DEVICE.type)
+    vocab_size = state["tok_emb.weight"].size(0)
+    model = ChesSLM(vocab_size, **arch).to(DEVICE)
+    model.load_state_dict(state)
     return model

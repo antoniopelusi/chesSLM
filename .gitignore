@@ -3,7 +3,7 @@ __pycache__
 .DS_Store
 
 chesslm_vocab.json
-chesslm_model.pt
+chesslm_model.safetensors
 *.tmp*
 
 log
